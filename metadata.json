@@ -1,0 +1,6 @@
+{
+  "name": "Lock-In",
+  "description": "A Device Owner-based device management foundation app.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
