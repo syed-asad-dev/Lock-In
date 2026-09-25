@@ -40,10 +40,46 @@ class LocalVpnService : VpnService() {
                 val packageName = intent.data?.schemeSpecificPart
                 if (!packageName.isNullOrBlank()) {
                     Log.i(TAG, "Dynamic receiver: Package installed: $packageName")
+                    
+                    // 1. Block/Uninstall if on hardcoded blocklist
                     AppBlocklistManager.blockPackageIfNeeded(context, packageName)
+                    
+                    // 2. Re-evaluate VPN tunnel if it's a quarantined app
+                    try {
+                        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0))
+                        } else {
+                            @Suppress("DEPRECATION")
+                            packageManager.getPackageInfo(packageName, 0)
+                        }
+
+                        if (NetworkQuarantineManager.shouldQuarantine(packageInfo)) {
+                            Log.i(TAG, "Newly installed app $packageName is explicitly quarantined. Rebuilding VPN tunnel.")
+                            reestablishVpn()
+                        }
+                    } catch (e: PackageManager.NameNotFoundException) {
+                        Log.w(TAG, "Package $packageName not found after install event.")
+                    }
                 }
             }
         }
+    }
+
+    private fun reestablishVpn() {
+        Log.i(TAG, "Re-establishing VPN interface...")
+        // Tearing down current thread and interface
+        vpnThread?.interrupt()
+        vpnThread = null
+        try {
+            vpnInterface?.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing interface during rebuild: ${e.message}")
+        }
+        vpnInterface = null
+        
+        // Creating new interface with updated app list
+        establishVpnInterface()
+        startVpnLoop()
     }
 
     override fun onCreate() {
@@ -99,7 +135,6 @@ class LocalVpnService : VpnService() {
             val builder = Builder()
                 .setSession("Lock-In VPN")
                 .addAddress("10.0.0.2", 32)
-                .addDnsServer("10.0.0.2")
                 // NOTE: We NO LONGER add 0.0.0.0/0 to capture EVERYTHING.
                 // This prevents the "Dead Internet" issue.
             
@@ -113,10 +148,10 @@ class LocalVpnService : VpnService() {
 
             var allowedCount = 0
             installedPackages.forEach { packageInfo ->
-                // Check if this app is a browser or untrusted app
-                if (!NetworkQuarantineManager.isPackageTrusted(packageInfo)) {
+                // Explicitly check if this app requires network quarantine
+                if (NetworkQuarantineManager.shouldQuarantine(packageInfo)) {
                     try {
-                        // FORCE only untrusted apps into the tunnel
+                        // FORCE only quarantined apps into the tunnel
                         builder.addAllowedApplication(packageInfo.packageName)
                         allowedCount++
                     } catch (e: Exception) {

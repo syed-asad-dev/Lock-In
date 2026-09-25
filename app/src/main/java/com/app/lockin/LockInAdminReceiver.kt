@@ -11,6 +11,7 @@ class LockInAdminReceiver : DeviceAdminReceiver() {
     override fun onEnabled(context: Context, intent: Intent) {
         super.onEnabled(context, intent)
         Log.d(TAG, "LockInAdminReceiver onEnabled: Device Admin / Device Owner enabled")
+        AccessibilityLockManager.applyAccessibilityLock(context)
     }
 
     override fun onDisabled(context: Context, intent: Intent) {

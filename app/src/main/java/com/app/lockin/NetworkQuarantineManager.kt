@@ -7,6 +7,12 @@ import android.util.Log
 object NetworkQuarantineManager {
     private const val TAG = "NetworkQuarantineManager"
 
+    // Explicit list of apps that require network quarantine (Black-Hole)
+    private val quarantinedPackages = setOf(
+        "hub.browser.video.downloader.saver" // Browser Hub
+    )
+
+    // Legacy list for reference/logging only
     private val trustedPackages = setOf(
         "com.whatsapp",
         "com.snapchat.android",
@@ -30,28 +36,44 @@ object NetworkQuarantineManager {
         "com.google.android.gms",
         "com.google.android.gsf",
         "com.android.chrome",
-        "com.app.lockin"
+        "com.app.lockin",
+        "com.spotify.music",
+        "com.linkedin.android"
     )
 
-    fun isPackageTrusted(packageInfo: PackageInfo): Boolean {
+    /**
+     * Rules for Network Quarantine:
+     * 1. System apps -> NO (Always Bypass)
+     * 2. Chrome or Lock-In -> NO (Always Bypass)
+     * 3. Explicit Risk Package -> YES (Capture)
+     * 4. Default -> NO (Bypass)
+     */
+    fun shouldQuarantine(packageInfo: PackageInfo): Boolean {
+        val packageName = packageInfo.packageName
         val appInfo = packageInfo.applicationInfo ?: return false
         
-        // Trust system apps
+        // Rule 1: Trust system apps
         if ((appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0) || 
             (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0)) {
-            return true
+            return false
         }
 
-        // Trust user-allowed apps
-        return trustedPackages.contains(packageInfo.packageName)
+        // Rule 2: Trust Chrome and Lock-In core
+        if (packageName == "com.android.chrome" || packageName == "com.app.lockin") {
+            return false
+        }
+
+        // Rule 3: Explicit Risk Check
+        return quarantinedPackages.contains(packageName)
     }
 
     fun logQuarantineDecision(packageInfo: PackageInfo) {
         val packageName = packageInfo.packageName
-        if (isPackageTrusted(packageInfo)) {
-            Log.i(TAG, "Decision: TRUSTED (bypass) for package: $packageName")
+        if (shouldQuarantine(packageInfo)) {
+            Log.w(TAG, "Decision: QUARANTINED (black-holed) for package: $packageName")
         } else {
-            Log.w(TAG, "Decision: QUARANTINED (blocked) for package: $packageName")
+            val type = if (trustedPackages.contains(packageName)) "USER-ALLOWED" else "DEFAULT-SAFE"
+            Log.i(TAG, "Decision: TRUSTED ($type) for package: $packageName")
         }
     }
 }
