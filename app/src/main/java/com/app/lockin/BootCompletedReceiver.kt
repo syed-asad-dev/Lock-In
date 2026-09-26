@@ -25,9 +25,6 @@ class BootCompletedReceiver : BroadcastReceiver() {
             } else {
                 Log.w(TAG, "Failed to re-assert Always-On VPN policy (app may not be Device Owner).")
             }
-
-            // Re-assert accessibility protection policy
-            AccessibilityLockManager.applyAccessibilityLock(context)
         }
     }
 }

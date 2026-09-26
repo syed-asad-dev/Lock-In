@@ -106,9 +106,6 @@ fun LockInScreen() {
 
     Log.e("MainActivity", "Initial scan: Found ${installedPackages.size} packages.")
 
-    // Enforce accessibility protection for Stay Focused if installed and Device Owner
-    AccessibilityLockManager.applyAccessibilityLock(context)
-
     installedPackages.forEach { packageInfo ->
       val pkgName = packageInfo.packageName
       
