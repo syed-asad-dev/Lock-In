@@ -9,9 +9,8 @@ private const val TAG = "ChromeDnsManager"
 private const val CHROME_PACKAGE = "com.android.chrome"
 
 /**
- * Forces Chrome's Secure DNS off AND blocks the NextDNS dashboard
- * specifically within Chrome on this device (does not touch the
- * shared NextDNS Denylist, which also affects the laptop).
+ * Enforces Chrome content restrictions: Google SafeSearch,
+ * strict YouTube mode, and a blocklist of adult/restricted domains.
  */
 fun applyChromeDnsLock(context: Context): Boolean {
     val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
@@ -29,9 +28,7 @@ fun applyChromeDnsLock(context: Context): Boolean {
 
     return try {
         val restrictions = Bundle().apply {
-            putString("DnsOverHttpsMode", "off")
             putStringArray("URLBlocklist", arrayOf(
-                "nextdns.io", "my.nextdns.io",
                 "pornhub.com", "chaturbate.com", "xvideos.com", "xnxx.com",
                 "x.com", "reddit.com", "quora.com", "xhamster.com", "redtube.com"
             ))
@@ -39,7 +36,7 @@ fun applyChromeDnsLock(context: Context): Boolean {
             putInt("ForceYouTubeRestrict", 2)
         }
         dpm.setApplicationRestrictions(adminComponent, CHROME_PACKAGE, restrictions)
-        Log.i(TAG, "Applied Chrome restrictions: DnsOverHttpsMode=off, URLBlocklist, SafeSearch=true, YouTubeRestrict=Strict(2)")
+        Log.i(TAG, "Applied Chrome restrictions: URLBlocklist, SafeSearch=true, YouTubeRestrict=Strict(2)")
         true
     } catch (e: SecurityException) {
         Log.e(TAG, "SecurityException while applying Chrome restrictions: ${e.message}", e)

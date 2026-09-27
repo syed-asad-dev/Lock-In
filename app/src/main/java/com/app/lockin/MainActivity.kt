@@ -199,13 +199,6 @@ fun LockInScreen() {
         modifier = Modifier.testTag("provisioning_instruction_card"),
       )
 
-      // DNS Lock Card
-      DnsLockCard(
-        isDeviceOwner = isDeviceOwner,
-        refreshTrigger = refreshTrigger,
-        modifier = Modifier.testTag("dns_lock_card"),
-      )
-
       // Safe Mode Block Card
       SafeBootLockCard(
         isDeviceOwner = isDeviceOwner,
@@ -462,185 +455,6 @@ fun ProvisioningInstructionCard(packageName: String, modifier: Modifier = Modifi
 }
 
 @Composable
-fun DnsLockCard(
-  isDeviceOwner: Boolean,
-  refreshTrigger: Int = 0,
-  modifier: Modifier = Modifier,
-) {
-  val context = LocalContext.current
-  var lockResult by remember { mutableStateOf<Boolean?>(null) }
-
-  // Check if lock is active (either just applied in this session or configured on device)
-  val isDnsLockAppliedOnDevice = remember(refreshTrigger, lockResult) {
-    checkIsDnsLockApplied(context)
-  }
-  val isDnsLockActive = isDeviceOwner && (lockResult == true || isDnsLockAppliedOnDevice)
-
-  // Cooldown states
-  var remainingMillis by remember(refreshTrigger, isDnsLockActive) {
-    mutableLongStateOf(CooldownManager.getRemainingCooldownMillis(context, "dns"))
-  }
-  var isReady by remember(refreshTrigger, isDnsLockActive) {
-    mutableStateOf(CooldownManager.isChangeReady(context, "dns"))
-  }
-
-  val containerColor =
-    if (isDeviceOwner) MaterialTheme.colorScheme.surfaceContainerHigh
-    else MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.6f)
-
-  Card(
-    modifier = modifier.fillMaxWidth(),
-    shape = RoundedCornerShape(16.dp),
-    colors = CardDefaults.cardColors(containerColor = containerColor),
-  ) {
-    Column(
-      modifier = Modifier.fillMaxWidth().padding(20.dp),
-      verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-      Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(
-          imageVector = Icons.Default.Security,
-          contentDescription = null,
-          tint =
-            if (isDeviceOwner) MaterialTheme.colorScheme.primary
-            else MaterialTheme.colorScheme.outline,
-          modifier = Modifier.size(20.dp),
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-          text = "DNS Lock",
-          style = MaterialTheme.typography.titleMedium,
-          fontWeight = FontWeight.SemiBold,
-          color =
-            if (isDeviceOwner) MaterialTheme.colorScheme.onSurface
-            else MaterialTheme.colorScheme.outline,
-        )
-      }
-
-      if (!isDeviceOwner) {
-        Text(
-          text = "Requires Device Owner",
-          style = MaterialTheme.typography.bodyMedium,
-          color = MaterialTheme.colorScheme.error,
-          fontWeight = FontWeight.Medium,
-        )
-      } else {
-        Text(
-          text = "Enforces private DNS provider (NextDNS) and disallows user changes.",
-          style = MaterialTheme.typography.bodySmall,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-      }
-
-      if (!isDnsLockActive) {
-        Button(
-          onClick = {
-            lockResult = applyDnsLock(context)
-            remainingMillis = CooldownManager.getRemainingCooldownMillis(context, "dns")
-            isReady = CooldownManager.isChangeReady(context, "dns")
-          },
-          enabled = isDeviceOwner,
-          modifier =
-            Modifier
-              .fillMaxWidth()
-              .height(48.dp)
-              .testTag("apply_dns_lock_button"),
-        ) {
-          Text(text = "Apply DNS Lock")
-        }
-
-        if (lockResult != null) {
-          val isSuccess = lockResult == true
-          Text(
-            text = if (isSuccess) "DNS Lock Applied" else "Failed — check Device Owner status",
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.Bold,
-            color =
-              if (isSuccess) MaterialTheme.colorScheme.primary
-              else MaterialTheme.colorScheme.error,
-            modifier = Modifier.testTag("dns_lock_result_text"),
-          )
-        }
-      }
-
-      // Secondary section: 7-day cooldown "Request Change" mechanism
-      if (isDnsLockActive) {
-        HorizontalDivider(
-          modifier = Modifier.padding(vertical = 4.dp),
-          color = MaterialTheme.colorScheme.outlineVariant,
-        )
-
-        Text(
-          text = "DNS Change Cooldown",
-          style = MaterialTheme.typography.titleSmall,
-          fontWeight = FontWeight.SemiBold,
-          color = MaterialTheme.colorScheme.onSurface,
-        )
-
-        if (isReady) {
-          Text(
-            text = "7-day cooldown elapsed. You may now confirm and reapply your DNS lock.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.primary,
-          )
-          Button(
-            onClick = {
-              val success = applyDnsLock(context)
-              lockResult = success
-              if (success) {
-                CooldownManager.clearRequest(context, "dns")
-              }
-              remainingMillis = CooldownManager.getRemainingCooldownMillis(context, "dns")
-              isReady = CooldownManager.isChangeReady(context, "dns")
-            },
-            modifier =
-              Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .testTag("confirm_reapply_dns_lock_button"),
-          ) {
-            Text(text = "Confirm & Reapply DNS Lock")
-          }
-        } else if (remainingMillis > 0L) {
-          val totalHours = remainingMillis / (1000 * 60 * 60)
-          val days = totalHours / 24
-          val hours = totalHours % 24
-
-          Text(
-            text = "Change Request Pending",
-            style = MaterialTheme.typography.bodySmall,
-            fontWeight = FontWeight.Medium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-          )
-          Text(
-            text = "Days: $days, Hours: $hours",
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.testTag("dns_cooldown_remaining_text"),
-          )
-        } else {
-          Button(
-            onClick = {
-              CooldownManager.requestChange(context, "dns")
-              remainingMillis = CooldownManager.getRemainingCooldownMillis(context, "dns")
-              isReady = CooldownManager.isChangeReady(context, "dns")
-            },
-            modifier =
-              Modifier
-                .fillMaxWidth()
-                .height(48.dp)
-                .testTag("request_dns_change_button"),
-          ) {
-            Text(text = "Request DNS Change")
-          }
-        }
-      }
-    }
-  }
-}
-
-@Composable
 fun SafeBootLockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
   val context = LocalContext.current
   var lockResult by remember { mutableStateOf<Boolean?>(null) }
@@ -827,9 +641,9 @@ fun ChromeDnsLockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
       modifier = Modifier.fillMaxWidth().padding(20.dp),
       verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-      Text(text = "Chrome DNS Lock", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+      Text(text = "Chrome Content Restrictions", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
       Text(
-        text = "Forces Chrome's Secure DNS off so it can't bypass the system DNS lock. Verify via chrome://policy after applying.",
+        text = "Enforces Google SafeSearch, strict YouTube restriction mode, and blocks adult/restricted web domains in Chrome. Verify via chrome://policy.",
         style = MaterialTheme.typography.bodySmall,
       )
       Button(
@@ -837,7 +651,7 @@ fun ChromeDnsLockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
         enabled = isDeviceOwner,
         modifier = Modifier.fillMaxWidth().height(48.dp),
       ) {
-        Text(text = "Apply Chrome DNS Lock")
+        Text(text = "Apply Chrome Restrictions")
       }
       if (result != null) {
         Text(text = if (result == true) "Applied — verify in chrome://policy" else "Failed")
@@ -1144,27 +958,6 @@ fun checkIsSelfProtectApplied(context: Context): Boolean {
       val restrictions = dpm.getUserRestrictions(adminComponent)
       val isDisallowAppsControl = restrictions.getBoolean(UserManager.DISALLOW_APPS_CONTROL, false)
       isUninstallBlocked || isDisallowAppsControl
-    } else {
-      false
-    }
-  } catch (e: Exception) {
-    false
-  }
-}
-
-fun checkIsDnsLockApplied(context: Context): Boolean {
-  val dpm =
-    context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
-      ?: return false
-  val adminComponent = LockInAdminReceiver.getComponentName(context)
-  return try {
-    if (dpm.isDeviceOwnerApp(context.packageName)) {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        val restrictions = dpm.getUserRestrictions(adminComponent)
-        restrictions.getBoolean(UserManager.DISALLOW_CONFIG_PRIVATE_DNS, false)
-      } else {
-        false
-      }
     } else {
       false
     }
