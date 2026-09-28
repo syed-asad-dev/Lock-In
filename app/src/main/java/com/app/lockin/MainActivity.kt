@@ -106,6 +106,14 @@ fun LockInScreen() {
 
     Log.e("MainActivity", "Initial scan: Found ${installedPackages.size} packages.")
 
+    // Admission Gate V1 initialization & reconciliation
+    try {
+      AdmissionGateManager.initializeGrandfatheringIfNeeded(context)
+      AdmissionGateManager.reconcileState(context)
+    } catch (e: Exception) {
+      Log.e("MainActivity", "Exception during Admission Gate startup reconciliation: ${e.message}", e)
+    }
+
     installedPackages.forEach { packageInfo ->
       val pkgName = packageInfo.packageName
       
@@ -191,6 +199,13 @@ fun LockInScreen() {
       DeviceOwnerInfoCard(
         isDeviceOwner = isDeviceOwner,
         modifier = Modifier.testTag("device_owner_info_card"),
+      )
+
+      // Admission Gate Card
+      AdmissionGateCard(
+        isDeviceOwner = isDeviceOwner,
+        refreshTrigger = refreshTrigger,
+        modifier = Modifier.testTag("admission_gate_card"),
       )
 
       // ADB Provisioning Helper Card
@@ -450,6 +465,142 @@ fun ProvisioningInstructionCard(packageName: String, modifier: Modifier = Modifi
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.outline,
       )
+    }
+  }
+}
+
+@Composable
+fun AdmissionGateCard(
+  isDeviceOwner: Boolean,
+  refreshTrigger: Int = 0,
+  modifier: Modifier = Modifier,
+) {
+  val context = LocalContext.current
+  var actionTrigger by remember { mutableIntStateOf(0) }
+  val pendingRecords = remember(refreshTrigger, actionTrigger) {
+    AdmissionGateManager.getPendingRecords(context)
+  }
+
+  val containerColor =
+    if (isDeviceOwner) MaterialTheme.colorScheme.surfaceContainerHigh
+    else MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.6f)
+
+  Card(
+    modifier = modifier.fillMaxWidth(),
+    shape = RoundedCornerShape(16.dp),
+    colors = CardDefaults.cardColors(containerColor = containerColor),
+  ) {
+    Column(
+      modifier = Modifier.fillMaxWidth().padding(20.dp),
+      verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+      Row(verticalAlignment = Alignment.CenterVertically) {
+        Icon(
+          imageVector = Icons.Default.Security,
+          contentDescription = null,
+          tint = if (isDeviceOwner) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+          modifier = Modifier.size(20.dp),
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(
+          text = "Admission Gate V1",
+          style = MaterialTheme.typography.titleMedium,
+          fontWeight = FontWeight.SemiBold,
+          color = if (isDeviceOwner) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline,
+        )
+      }
+
+      if (!isDeviceOwner) {
+        Text(
+          text = "Requires Device Owner to manage app admission.",
+          style = MaterialTheme.typography.bodyMedium,
+          color = MaterialTheme.colorScheme.error,
+        )
+      } else if (pendingRecords.isEmpty()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+          Icon(
+            imageVector = Icons.Default.CheckCircle,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(18.dp)
+          )
+          Spacer(modifier = Modifier.width(6.dp))
+          Text(
+            text = "No pending app installation requests.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+      } else {
+        Text(
+          text = "${pendingRecords.size} pending app(s) suspended awaiting review:",
+          style = MaterialTheme.typography.bodyMedium,
+          fontWeight = FontWeight.Bold,
+          color = MaterialTheme.colorScheme.error,
+        )
+
+        pendingRecords.forEach { record ->
+          Surface(
+            color = MaterialTheme.colorScheme.surfaceContainerHighest,
+            shape = RoundedCornerShape(12.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+          ) {
+            Column(
+              modifier = Modifier.fillMaxWidth().padding(12.dp),
+              verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+              Text(
+                text = record.appLabel,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold
+              )
+              Text(
+                text = "Package: ${record.packageName}",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              val sourceText = record.installerPackageName ?: "Unknown / Direct Sideload"
+              Text(
+                text = "Installer: $sourceText",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              Text(
+                text = "Status: PENDING (Suspended)",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.error
+              )
+
+              Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+              ) {
+                Button(
+                  onClick = {
+                    AdmissionGateManager.approvePackage(context, record.packageName)
+                    actionTrigger++
+                  },
+                  modifier = Modifier.weight(1f).height(40.dp)
+                ) {
+                  Text("Approve")
+                }
+                Button(
+                  onClick = {
+                    AdmissionGateManager.denyPackage(context, record.packageName)
+                    actionTrigger++
+                  },
+                  colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+                  modifier = Modifier.weight(1f).height(40.dp)
+                ) {
+                  Text("Deny")
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

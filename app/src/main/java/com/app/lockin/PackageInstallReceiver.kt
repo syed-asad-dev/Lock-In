@@ -18,7 +18,22 @@ class PackageInstallReceiver : BroadcastReceiver() {
         if (!packageName.isNullOrBlank()) {
           val replacing = intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)
           Log.i(TAG, "Package installed event received for: $packageName (replacing=$replacing)")
+          
+          // 1. Check existing hard blocklist first
           AppBlocklistManager.blockPackageIfNeeded(context, packageName)
+
+          // 2. If app is not a hard-blocked package, send to AdmissionGateManager
+          if (!AppBlocklistManager.isPackageBlocked(context, packageName)) {
+            AdmissionGateManager.onPackageInstalled(context, packageName, replacing)
+          }
+        }
+      }
+      Intent.ACTION_PACKAGE_REMOVED -> {
+        val packageName = intent.data?.schemeSpecificPart
+        if (!packageName.isNullOrBlank()) {
+          val replacing = intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)
+          Log.i(TAG, "Package removed event received for: $packageName (replacing=$replacing)")
+          AdmissionGateManager.onPackageRemoved(context, packageName, replacing)
         }
       }
       "com.app.lockin.ACTION_UNINSTALL_RESULT" -> {
