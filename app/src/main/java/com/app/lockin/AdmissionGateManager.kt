@@ -9,190 +9,275 @@ import android.os.Build
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
-import java.security.MessageDigest
+import java.util.UUID
 
-private const val TAG = "AdmissionGateManager"
+private const val GATE_TAG = "AdmissionGateManager"
 private const val PREFS_NAME = "admission_gate_prefs"
-private const val KEY_IS_GRANDFATHERED = "is_grandfathered_initialized"
-private const val KEY_RECORDS_JSON = "admission_gate_records_json"
+private const val KEY_STATE_SNAPSHOT = "admission_gate_state_snapshot"
 
-enum class AdmissionStatus {
-    PENDING,
-    APPROVED,
-    DENIED
-}
+private const val LEGACY_KEY_IS_GRANDFATHERED = "is_grandfathered_initialized"
+private const val LEGACY_KEY_RECORDS_JSON = "admission_gate_records_json"
 
-data class AdmissionGateRecord(
-    val packageName: String,
-    val status: AdmissionStatus,
-    val signingCertDigest: String,
-    val installerPackageName: String?,
-    val versionCode: Long,
-    val versionName: String?,
-    val appLabel: String,
-    val installedAtEpochMs: Long,
-    val statusUpdatedAtEpochMs: Long
+private const val STATE_SCHEMA_VERSION = 2
+
+data class AdmissionGateState(
+    val schemaVersion: Int,
+    val snapshotId: String,
+    val grandfatheringInitialized: Boolean,
+    val grandfatheredAtEpochMs: Long?,
+    val records: MutableMap<String, AdmissionGateRecord>
 )
 
+/**
+ * Device-owner admission enforcement.
+ *
+ * The only persisted state is one JSON envelope. The grandfathering marker,
+ * snapshot id, and records are committed together, so a restart cannot see a
+ * marker from one snapshot with records from another. All allow transitions
+ * are fail-closed and persist APPROVED before attempting to unsuspend.
+ */
 object AdmissionGateManager {
-
     @Synchronized
-    fun isGrandfatheredInitialized(context: Context): Boolean {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        return prefs.getBoolean(KEY_IS_GRANDFATHERED, false)
-    }
+    fun isGrandfatheredInitialized(context: Context): Boolean =
+        loadState(context).grandfatheringInitialized
 
     @Synchronized
     fun initializeGrandfatheringIfNeeded(context: Context, excludePackageName: String? = null) {
-        if (isGrandfatheredInitialized(context)) return
+        val existingState = loadState(context)
+        if (existingState.grandfatheringInitialized) return
 
-        Log.i(TAG, "Initializing Admission Gate baseline grandfathering (excluding: $excludePackageName)...")
         val pm = context.packageManager
-        val recordsMap = loadRecordsInternal(context)
         val now = System.currentTimeMillis()
-
-        val installedPackages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()))
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            @Suppress("DEPRECATION")
-            pm.getInstalledPackages(PackageManager.GET_SIGNING_CERTIFICATES)
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getInstalledPackages(PackageManager.GET_SIGNATURES)
-        }
-
+        val snapshotId = UUID.randomUUID().toString()
+        val records = existingState.records.toMutableMap()
+        val pendingForReview = mutableListOf<String>()
         var grandfatheredCount = 0
+
+        // One package-manager read is the baseline snapshot. The snapshot id
+        // is written in the same JSON envelope as every generated record.
+        val installedPackages = getInstalledPackages(pm)
         installedPackages.forEach { packageInfo ->
-            val pkgName = packageInfo.packageName
-            if (shouldExemptPackage(context, packageInfo, excludePackageName)) {
+            val packageName = packageInfo.packageName
+            if (packageName == excludePackageName) return@forEach
+
+            if (isHardBlocked(context, packageName)) {
+                enforceHardBlock(context, packageName)
+                records.remove(packageName)
+                return@forEach
+            }
+            if (shouldExemptPackage(context, packageInfo)) {
+                records.remove(packageName)
                 return@forEach
             }
 
-            val appInfo = packageInfo.applicationInfo
-            val label = appInfo?.loadLabel(pm)?.toString() ?: pkgName
-            val vCode = getVersionCode(packageInfo)
-            val vName = packageInfo.versionName
-            val certDigest = getSigningCertDigest(packageInfo)
-            val installer = getInstallerPackageName(pm, pkgName)
-
-            val record = AdmissionGateRecord(
-                packageName = pkgName,
-                status = AdmissionStatus.APPROVED,
-                signingCertDigest = certDigest,
-                installerPackageName = installer,
-                versionCode = vCode,
-                versionName = vName,
-                appLabel = label,
-                installedAtEpochMs = now,
-                statusUpdatedAtEpochMs = now
+            val audit = AppAuditCollector.collect(context, packageInfo)
+            val identity = audit.identity
+            val status = if (identity.signingIdentitySha256.isNotEmpty()) {
+                AdmissionStatus.APPROVED
+            } else {
+                AdmissionStatus.PENDING
+            }
+            if (status == AdmissionStatus.PENDING) {
+                suspendPackageIfNeeded(context, packageName, true)
+                pendingForReview += packageName
+            }
+            records[packageName] = recordFromAudit(
+                audit = audit,
+                status = status,
+                now = now,
+                hardBlocked = false,
+                externalResult = null,
+                enforcementMessage = if (status == AdmissionStatus.APPROVED) {
+                    "GRANDFATHERED_BASELINE"
+                } else {
+                    "SIGNING_IDENTITY_UNAVAILABLE"
+                }
             )
-            recordsMap[pkgName] = record
             grandfatheredCount++
         }
 
-        saveRecordsInternal(context, recordsMap)
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean(KEY_IS_GRANDFATHERED, true)
-            .apply()
+        val state = AdmissionGateState(
+            schemaVersion = STATE_SCHEMA_VERSION,
+            snapshotId = snapshotId,
+            grandfatheringInitialized = true,
+            grandfatheredAtEpochMs = now,
+            records = records
+        )
+        if (!saveState(context, state)) {
+            Log.e(GATE_TAG, "Could not commit baseline snapshot $snapshotId; it will be retried.")
+            return
+        }
 
-        Log.i(TAG, "Baseline grandfathering initialized. Grandfathered $grandfatheredCount existing apps as APPROVED.")
+        pendingForReview.forEach { AdmissionWorkScheduler.enqueue(context, it) }
+        Log.i(
+            GATE_TAG,
+            "Committed baseline snapshot $snapshotId: grandfathered=$grandfatheredCount pending=${pendingForReview.size}"
+        )
     }
 
+    /** Called synchronously by the install receiver after hard-block enforcement. */
     @Synchronized
     fun onPackageInstalled(context: Context, packageName: String, isReplacing: Boolean) {
+        if (isHardBlocked(context, packageName)) {
+            onHardBlockedPackage(context, packageName)
+            return
+        }
+
+        val packageInfo = AdmissionPackageQueries.getPackageInfo(context.packageManager, packageName)
+            ?: run {
+                Log.w(GATE_TAG, "Package $packageName was not queryable after install.")
+                return
+            }
+        if (shouldExemptPackage(context, packageInfo)) return
+
+        // Suspend the event package before any potentially expensive first-run
+        // baseline scan. It is excluded from that snapshot below, so a fresh
+        // install can never execute during grandfather initialization.
+        suspendPackageIfNeeded(context, packageName, true)
+
         if (!isGrandfatheredInitialized(context)) {
+            // The event package is deliberately excluded from the one-time
+            // baseline so it can never be grandfathered by a race.
             initializeGrandfatheringIfNeeded(context, excludePackageName = packageName)
         }
 
-        val pm = context.packageManager
-        val packageInfo = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()))
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
-            }
-        } catch (e: PackageManager.NameNotFoundException) {
-            Log.w(TAG, "Package $packageName not found during onPackageInstalled.")
-            return
-        }
-
-        if (shouldExemptPackage(context, packageInfo, excludePackageName = null)) {
-            Log.d(TAG, "Package $packageName is exempt from Admission Gate.")
-            return
-        }
-
-        val recordsMap = loadRecordsInternal(context)
-        val existingRecord = recordsMap[packageName]
+        val state = loadState(context)
+        val existing = state.records[packageName]
+        val audit = AppAuditCollector.collect(context, packageInfo)
+        val identity = audit.identity
         val now = System.currentTimeMillis()
 
-        val certDigest = getSigningCertDigest(packageInfo)
-        val installer = getInstallerPackageName(pm, packageName)
-        val appInfo = packageInfo.applicationInfo
-        val label = appInfo?.loadLabel(pm)?.toString() ?: packageName
-        val vCode = getVersionCode(packageInfo)
-        val vName = packageInfo.versionName
+        val existingIdentityMatches = existing?.let {
+            AdmissionIdentityVerifier.validate(
+                expected = it.storedIdentity(),
+                actual = identity,
+                requireVersionMatch = false
+            ).isMatch
+        } == true
 
-        if (isReplacing && existingRecord != null) {
-            val isDigestMatch = existingRecord.signingCertDigest.isNotBlank() && existingRecord.signingCertDigest == certDigest
-            val isInstallerMatch = existingRecord.installerPackageName == installer
+        // A local DENY is authoritative for this package name. Reinstalling or
+        // replacing it cannot turn it into an externally approved package.
+        val localDenied = existing?.status == AdmissionStatus.DENIED && !existing.hardBlocked
+        val preserveApproved = isReplacing &&
+            existing?.status == AdmissionStatus.APPROVED &&
+            existingIdentityMatches &&
+            identity.signingIdentitySha256.isNotEmpty()
 
-            if (isDigestMatch && isInstallerMatch) {
-                Log.i(TAG, "Package $packageName updated with matching identity. Remaining in status: ${existingRecord.status}.")
-                val updatedRecord = existingRecord.copy(
-                    versionCode = vCode,
-                    versionName = vName,
-                    statusUpdatedAtEpochMs = now
-                )
-                recordsMap[packageName] = updatedRecord
-                saveRecordsInternal(context, recordsMap)
-
-                // Preserve existing suspension for PENDING or DENIED
-                if (existingRecord.status == AdmissionStatus.PENDING || existingRecord.status == AdmissionStatus.DENIED) {
-                    suspendPackageIfNeeded(context, packageName, true)
+        val record: AdmissionGateRecord
+        val shouldQueue: Boolean
+        if (preserveApproved) {
+            record = mergeCurrentIdentity(
+                existing = existing!!,
+                identity = identity,
+                audit = existing.auditResult,
+                now = now,
+                status = AdmissionStatus.APPROVED,
+                externalResult = existing.externalResult,
+                enforcementMessage = "APPROVED_IDENTITY_REVALIDATED"
+            )
+            shouldQueue = false
+        } else {
+            val status = if (localDenied) AdmissionStatus.DENIED else AdmissionStatus.PENDING
+            record = recordFromAudit(
+                audit = audit,
+                status = status,
+                now = now,
+                installedAtEpochMs = existing?.installedAtEpochMs ?: now,
+                hardBlocked = false,
+                externalResult = if (status == AdmissionStatus.DENIED) existing?.externalResult else null,
+                enforcementMessage = if (status == AdmissionStatus.DENIED) {
+                    "LOCAL_DENY_PRESERVED"
+                } else {
+                    "PENDING_SUSPENDED"
                 }
-                return
-            } else {
-                Log.w(TAG, "Package $packageName update mismatch (digestMatch=$isDigestMatch, installerMatch=$isInstallerMatch). Transitioning to PENDING and suspending.")
-            }
+            )
+            shouldQueue = status == AdmissionStatus.PENDING
         }
 
-        // Fresh install OR update identity mismatch -> 1. Suspend 2. Persist PENDING
-        suspendPackageIfNeeded(context, packageName, true)
+        val updatedRecords = state.records.toMutableMap().apply { put(packageName, record) }
+        val updatedState = state.copy(records = updatedRecords)
+        if (!saveState(context, updatedState)) {
+            Log.e(GATE_TAG, "Failed to persist install decision for $packageName")
+            return
+        }
 
-        val newRecord = AdmissionGateRecord(
-            packageName = packageName,
-            status = AdmissionStatus.PENDING,
-            signingCertDigest = certDigest,
-            installerPackageName = installer,
-            versionCode = vCode,
-            versionName = vName,
-            appLabel = label,
-            installedAtEpochMs = existingRecord?.installedAtEpochMs ?: now,
-            statusUpdatedAtEpochMs = now
-        )
-        recordsMap[packageName] = newRecord
-        saveRecordsInternal(context, recordsMap)
+        if (preserveApproved) {
+            // This is an already approved, same-signer/source replacement. The
+            // state is committed before restoring normal package availability.
+            if (!suspendPackageIfNeeded(context, packageName, false)) {
+                val pending = record.copy(
+                    status = AdmissionStatus.PENDING,
+                    finalDecision = ClassificationDecision.UNKNOWN,
+                    statusUpdatedAtEpochMs = System.currentTimeMillis(),
+                    enforcementMessage = "UNSUSPEND_FAILED_FAIL_CLOSED"
+                )
+                saveState(context, updatedState.copy(records = updatedState.records.toMutableMap().apply {
+                    put(packageName, pending)
+                }))
+                AdmissionWorkScheduler.enqueue(context, packageName)
+            }
+        } else if (shouldQueue) {
+            AdmissionWorkScheduler.enqueue(context, packageName)
+        }
+    }
+
+    @Synchronized
+    fun onHardBlockedPackage(context: Context, packageName: String) {
+        // Hard-block enforcement is intentionally repeated here even though
+        // the receiver already called it. This keeps all alternate entry paths
+        // authoritative and prevents an old APPROVED record being reused.
+        enforceHardBlock(context, packageName)
+        val state = loadState(context)
+        val old = state.records[packageName]
+        val packageInfo = AdmissionPackageQueries.getPackageInfo(context.packageManager, packageName)
+        val audit = packageInfo?.let { AppAuditCollector.collect(context, it) }
+        val now = System.currentTimeMillis()
+        val denied = if (audit != null) {
+            recordFromAudit(
+                audit = audit,
+                status = AdmissionStatus.DENIED,
+                now = now,
+                installedAtEpochMs = old?.installedAtEpochMs ?: now,
+                hardBlocked = true,
+                externalResult = old?.externalResult,
+                enforcementMessage = "HARD_BLOCKED_AUTHORITATIVE"
+            )
+        } else if (old != null) {
+            old.copy(
+                status = AdmissionStatus.DENIED,
+                hardBlocked = true,
+                finalDecision = ClassificationDecision.DENY,
+                statusUpdatedAtEpochMs = now,
+                enforcementMessage = "HARD_BLOCKED_AUTHORITATIVE"
+            )
+        } else {
+            AdmissionGateRecord(
+                packageName = packageName,
+                status = AdmissionStatus.DENIED,
+                signingCertDigest = "",
+                installerPackageName = null,
+                versionCode = 0L,
+                versionName = null,
+                appLabel = packageName,
+                installedAtEpochMs = now,
+                statusUpdatedAtEpochMs = now,
+                finalDecision = ClassificationDecision.DENY,
+                hardBlocked = true,
+                enforcementMessage = "HARD_BLOCKED_AUTHORITATIVE"
+            )
+        }
+        val updated = state.copy(records = state.records.toMutableMap().apply { put(packageName, denied) })
+        saveState(context, updated)
     }
 
     @Synchronized
     fun onPackageRemoved(context: Context, packageName: String, isReplacing: Boolean) {
-        if (isReplacing) {
-            Log.d(TAG, "Package $packageName removed for replacement. Keeping admission record.")
-            return
-        }
-
-        val recordsMap = loadRecordsInternal(context)
-        if (recordsMap.remove(packageName) != null) {
-            saveRecordsInternal(context, recordsMap)
-            Log.i(TAG, "Package $packageName uninstalled. Removed admission record.")
-        }
+        if (isReplacing) return
+        val state = loadState(context)
+        if (state.records.remove(packageName) != null) saveState(context, state)
     }
 
+    /** Re-applies fail-closed states after boot, foreground startup, or repair. */
     @Synchronized
     fun reconcileState(context: Context) {
         if (!isGrandfatheredInitialized(context)) {
@@ -200,362 +285,727 @@ object AdmissionGateManager {
             return
         }
 
-        Log.i(TAG, "Running Admission Gate state reconciliation...")
-        val pm = context.packageManager
-        val recordsMap = loadRecordsInternal(context)
+        val state = loadState(context)
+        val records = state.records.toMutableMap()
+        val installedPackages = getInstalledPackages(context.packageManager)
+        val installedMap = installedPackages.associateBy { it.packageName }
+        val pendingForReview = mutableListOf<String>()
         val now = System.currentTimeMillis()
 
-        val installedPackages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            pm.getInstalledPackages(PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()))
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            @Suppress("DEPRECATION")
-            pm.getInstalledPackages(PackageManager.GET_SIGNING_CERTIFICATES)
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getInstalledPackages(PackageManager.GET_SIGNATURES)
-        }
-
-        val installedMap = installedPackages.associateBy { it.packageName }
-
-        // 1. Re-evaluate recorded apps
-        recordsMap.values.toList().forEach { record ->
-            val pkgName = record.packageName
-            val installedInfo = installedMap[pkgName]
-
-            if (installedInfo == null) {
-                // Uninstalled while inactive -> remove record
-                Log.i(TAG, "Reconciliation: $pkgName no longer installed. Removing record.")
-                recordsMap.remove(pkgName)
+        records.values.toList().forEach { record ->
+            val packageInfo = installedMap[record.packageName]
+            if (packageInfo == null) {
+                records.remove(record.packageName)
                 return@forEach
             }
 
-            if (shouldExemptPackage(context, installedInfo, excludePackageName = null)) {
-                recordsMap.remove(pkgName)
+            if (isHardBlocked(context, record.packageName)) {
+                enforceHardBlock(context, record.packageName)
+                records[record.packageName] = record.copy(
+                    status = AdmissionStatus.DENIED,
+                    hardBlocked = true,
+                    finalDecision = ClassificationDecision.DENY,
+                    statusUpdatedAtEpochMs = now,
+                    enforcementMessage = "HARD_BLOCKED_AUTHORITATIVE"
+                )
+                return@forEach
+            }
+            if (shouldExemptPackage(context, packageInfo)) {
+                records.remove(record.packageName)
                 return@forEach
             }
 
+            val audit = AppAuditCollector.collect(context, packageInfo)
+            val identity = audit.identity
             when (record.status) {
-                AdmissionStatus.PENDING, AdmissionStatus.DENIED -> {
-                    suspendPackageIfNeeded(context, pkgName, true)
+                AdmissionStatus.PENDING -> {
+                    suspendPackageIfNeeded(context, record.packageName, true)
+                    records[record.packageName] = mergeCurrentIdentity(
+                        existing = record,
+                        identity = identity,
+                        audit = audit,
+                        now = record.statusUpdatedAtEpochMs,
+                        status = AdmissionStatus.PENDING,
+                        externalResult = record.externalResult,
+                        enforcementMessage = "PENDING_SUSPENDED"
+                    )
+                    pendingForReview += record.packageName
+                }
+                AdmissionStatus.DENIED -> {
+                    suspendPackageIfNeeded(context, record.packageName, true)
+                    records[record.packageName] = mergeCurrentIdentity(
+                        existing = record,
+                        identity = identity,
+                        audit = audit,
+                        now = record.statusUpdatedAtEpochMs,
+                        status = AdmissionStatus.DENIED,
+                        externalResult = record.externalResult,
+                        enforcementMessage = if (record.hardBlocked) {
+                            "HARD_BLOCKED_AUTHORITATIVE"
+                        } else {
+                            "LOCAL_DENY_PRESERVED"
+                        }
+                    )
                 }
                 AdmissionStatus.APPROVED -> {
-                    val currentCertDigest = getSigningCertDigest(installedInfo)
-                    if (record.signingCertDigest.isNotBlank() && record.signingCertDigest != currentCertDigest) {
-                        Log.w(TAG, "Reconciliation: Signature mismatch for $pkgName! Reverting to PENDING and suspending.")
-                        suspendPackageIfNeeded(context, pkgName, true)
-                        val updatedRecord = record.copy(
+                    val validation = AdmissionIdentityVerifier.validate(
+                        expected = record.storedIdentity(),
+                        actual = identity,
+                        requireVersionMatch = false
+                    )
+                    if (!validation.isMatch || identity.signingIdentitySha256.isEmpty()) {
+                        suspendPackageIfNeeded(context, record.packageName, true)
+                        val pending = mergeCurrentIdentity(
+                            existing = record,
+                            identity = identity,
+                            audit = audit,
+                            now = now,
                             status = AdmissionStatus.PENDING,
-                            statusUpdatedAtEpochMs = now
+                            externalResult = null,
+                            enforcementMessage = validation.reasonCodes.joinToString(",")
+                                .ifBlank { "APPROVED_IDENTITY_REVALIDATION_FAILED" }
                         )
-                        recordsMap[pkgName] = updatedRecord
+                        records[record.packageName] = pending
+                        pendingForReview += record.packageName
                     } else {
-                        // Ensure approved app is NOT suspended
-                        suspendPackageIfNeeded(context, pkgName, false)
+                        // The stored signer and reliable install source still
+                        // match; only then is an APPROVED package unsuspended.
+                        val refreshed = mergeCurrentIdentity(
+                            existing = record,
+                            identity = identity,
+                            audit = record.auditResult,
+                            now = record.statusUpdatedAtEpochMs,
+                            status = AdmissionStatus.APPROVED,
+                            externalResult = record.externalResult,
+                            enforcementMessage = "APPROVED_IDENTITY_REVALIDATED"
+                        )
+                        records[record.packageName] = refreshed
+                        if (saveState(context, state.copy(records = records))) {
+                            if (!suspendPackageIfNeeded(context, record.packageName, false)) {
+                                records[record.packageName] = refreshed.copy(
+                                    status = AdmissionStatus.PENDING,
+                                    finalDecision = ClassificationDecision.UNKNOWN,
+                                    statusUpdatedAtEpochMs = now,
+                                    enforcementMessage = "UNSUSPEND_FAILED_FAIL_CLOSED"
+                                )
+                                pendingForReview += record.packageName
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // 2. Discover unrecorded non-system apps installed while inactive
+        // Discover packages installed while the receiver/app was inactive.
         installedPackages.forEach { packageInfo ->
-            val pkgName = packageInfo.packageName
-            if (shouldExemptPackage(context, packageInfo, excludePackageName = null)) return@forEach
-
-            if (!recordsMap.containsKey(pkgName)) {
-                Log.w(TAG, "Reconciliation: Discovered unrecorded non-system app $pkgName. Marking PENDING and suspending.")
-                val appInfo = packageInfo.applicationInfo
-                val label = appInfo?.loadLabel(pm)?.toString() ?: pkgName
-                val vCode = getVersionCode(packageInfo)
-                val vName = packageInfo.versionName
-                val certDigest = getSigningCertDigest(packageInfo)
-                val installer = getInstallerPackageName(pm, pkgName)
-
-                suspendPackageIfNeeded(context, pkgName, true)
-
-                val record = AdmissionGateRecord(
-                    packageName = pkgName,
-                    status = AdmissionStatus.PENDING,
-                    signingCertDigest = certDigest,
-                    installerPackageName = installer,
-                    versionCode = vCode,
-                    versionName = vName,
-                    appLabel = label,
-                    installedAtEpochMs = now,
-                    statusUpdatedAtEpochMs = now
-                )
-                recordsMap[pkgName] = record
+            val packageName = packageInfo.packageName
+            if (records.containsKey(packageName)) return@forEach
+            if (isHardBlocked(context, packageName)) {
+                enforceHardBlock(context, packageName)
+                return@forEach
             }
-        }
+            if (shouldExemptPackage(context, packageInfo)) return@forEach
 
-        saveRecordsInternal(context, recordsMap)
-        Log.i(TAG, "Admission Gate reconciliation completed. Total records: ${recordsMap.size}")
-    }
-
-    @Synchronized
-    fun approvePackage(context: Context, packageName: String): Boolean {
-        if (AppBlocklistManager.isPackageBlocked(context, packageName)) {
-            Log.w(TAG, "Cannot approve $packageName: package is hard-blocked by AppBlocklistManager.")
-            return false
-        }
-
-        val recordsMap = loadRecordsInternal(context)
-        val record = recordsMap[packageName]
-        if (record == null) {
-            Log.w(TAG, "Cannot approve $packageName: record not found.")
-            return false
-        }
-
-        val pm = context.packageManager
-        val packageInfo = try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                pm.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong()))
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Cannot approve $packageName: package info query failed: ${e.message}")
-            return false
-        }
-
-        val currentDigest = getSigningCertDigest(packageInfo)
-        val currentInstaller = getInstallerPackageName(pm, packageName)
-        val vCode = getVersionCode(packageInfo)
-        val vName = packageInfo.versionName
-        val now = System.currentTimeMillis()
-
-        val isDigestMatch = record.signingCertDigest.isNotBlank() && record.signingCertDigest == currentDigest
-        val isInstallerMatch = record.installerPackageName == currentInstaller
-
-        if (!isDigestMatch || !isInstallerMatch) {
-            Log.w(TAG, "Cannot approve $packageName: identity changed since record creation (digestMatch=$isDigestMatch, installerMatch=$isInstallerMatch).")
+            val audit = AppAuditCollector.collect(context, packageInfo)
             suspendPackageIfNeeded(context, packageName, true)
-
-            val refreshedRecord = record.copy(
+            records[packageName] = recordFromAudit(
+                audit = audit,
                 status = AdmissionStatus.PENDING,
-                signingCertDigest = currentDigest,
-                installerPackageName = currentInstaller,
-                versionCode = vCode,
-                versionName = vName,
-                statusUpdatedAtEpochMs = now
+                now = now,
+                hardBlocked = false,
+                externalResult = null,
+                enforcementMessage = "DISCOVERED_PENDING_SUSPENDED"
             )
-            recordsMap[packageName] = refreshedRecord
-            saveRecordsInternal(context, recordsMap)
-            return false
+            pendingForReview += packageName
         }
 
-        // Enforcement order for Approval:
-        // 1. Unsuspend package
-        suspendPackageIfNeeded(context, packageName, false)
-
-        // 2. Persist APPROVED state
-        val updatedRecord = record.copy(
-            status = AdmissionStatus.APPROVED,
-            signingCertDigest = currentDigest,
-            installerPackageName = currentInstaller,
-            versionCode = vCode,
-            versionName = vName,
-            statusUpdatedAtEpochMs = now
-        )
-        recordsMap[packageName] = updatedRecord
-        saveRecordsInternal(context, recordsMap)
-
-        Log.i(TAG, "Successfully APPROVED and unsuspended package: $packageName")
-        return true
+        if (saveState(context, state.copy(records = records))) {
+            pendingForReview.distinct().forEach { AdmissionWorkScheduler.enqueue(context, it) }
+        }
     }
 
     @Synchronized
     fun denyPackage(context: Context, packageName: String): Boolean {
-        val recordsMap = loadRecordsInternal(context)
-        val record = recordsMap[packageName]
-        if (record == null) {
-            Log.w(TAG, "Cannot deny $packageName: record not found.")
+        if (isHardBlocked(context, packageName)) {
+            onHardBlockedPackage(context, packageName)
             return false
         }
-
-        // Enforcement order for Denial:
-        // 1. Suspend package
+        val state = loadState(context)
+        val record = state.records[packageName] ?: return false
         suspendPackageIfNeeded(context, packageName, true)
-
-        // 2. Persist DENIED state
-        val updatedRecord = record.copy(
+        val updated = record.copy(
             status = AdmissionStatus.DENIED,
-            statusUpdatedAtEpochMs = System.currentTimeMillis()
+            finalDecision = ClassificationDecision.DENY,
+            statusUpdatedAtEpochMs = System.currentTimeMillis(),
+            enforcementMessage = "LOCAL_DENY"
         )
-        recordsMap[packageName] = updatedRecord
-        saveRecordsInternal(context, recordsMap)
+        val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
+            put(packageName, updated)
+        }))
+        return saved
+    }
 
-        Log.i(TAG, "Successfully DENIED and suspended package: $packageName")
+    /**
+     * Applies an external response. This is the only production ALLOW path;
+     * there is deliberately no local approve method or UI action.
+     */
+    @Synchronized
+    fun applyExternalResult(
+        context: Context,
+        packageName: String,
+        externalResult: AdmissionExternalResult
+    ): Boolean {
+        val state = loadState(context)
+        val record = state.records[packageName] ?: return false
+        if (isHardBlocked(context, packageName) || record.hardBlocked) {
+            onHardBlockedPackage(context, packageName)
+            return false
+        }
+        // A response that raced with a local/external DENY, removal, or an
+        // earlier approval is stale and must never overwrite that state.
+        if (record.status != AdmissionStatus.PENDING) return false
+
+        if (externalResult.decision == ClassificationDecision.DENY) {
+            suspendPackageIfNeeded(context, packageName, true)
+            val denied = record.copy(
+                status = AdmissionStatus.DENIED,
+                externalResult = externalResult,
+                finalDecision = ClassificationDecision.DENY,
+                statusUpdatedAtEpochMs = System.currentTimeMillis(),
+                enforcementMessage = "EXTERNAL_DENY_SUSPENDED"
+            )
+            val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
+                put(packageName, denied)
+            }))
+            return saved
+        }
+
+        if (externalResult.decision != ClassificationDecision.ALLOW) {
+            suspendPackageIfNeeded(context, packageName, true)
+            val pending = record.copy(
+                status = AdmissionStatus.PENDING,
+                externalResult = externalResult,
+                finalDecision = ClassificationDecision.UNKNOWN,
+                statusUpdatedAtEpochMs = System.currentTimeMillis(),
+                enforcementMessage = externalResult.reasonCodes.joinToString(",")
+                    .ifBlank { "EXTERNAL_UNKNOWN_SUSPENDED" }
+            )
+            val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
+                put(packageName, pending)
+            }))
+            return saved
+        }
+
+        // ALLOW requires a fresh PackageManager identity check against the
+        // stored install, the original local audit, and the backend response.
+        val packageInfo = AdmissionPackageQueries.getPackageInfo(context.packageManager, packageName)
+            ?: return transitionToUnknownAfterIdentityFailure(
+                context,
+                state,
+                record,
+                externalResult,
+                "IDENTITY_PACKAGE_MISSING"
+            )
+        val currentAudit = AppAuditCollector.collect(context, packageInfo)
+        val currentIdentity = currentAudit.identity
+        val expectedIdentity = record.storedIdentity()
+        val auditIdentity = record.auditResult?.identity
+        val responseIdentity = externalResult.identity
+        val reasons = mutableListOf<String>()
+        if (responseIdentity == null) reasons += "IDENTITY_EXTERNAL_MISSING"
+        if (auditIdentity == null) reasons += "IDENTITY_LOCAL_AUDIT_MISSING"
+        if (isHardBlocked(context, packageName)) reasons += "HARD_BLOCKED_AUTHORITATIVE"
+        if (responseIdentity != null) {
+            reasons += AdmissionIdentityVerifier.validate(
+                expected = expectedIdentity,
+                actual = responseIdentity,
+                requireVersionMatch = true
+            ).reasonCodes
+        }
+        if (auditIdentity != null) {
+            reasons += AdmissionIdentityVerifier.validate(
+                expected = auditIdentity,
+                actual = currentIdentity,
+                requireVersionMatch = true
+            ).reasonCodes
+        }
+        reasons += AdmissionIdentityVerifier.validate(
+            expected = expectedIdentity,
+            actual = currentIdentity,
+            requireVersionMatch = true
+        ).reasonCodes
+
+        if (reasons.isNotEmpty() || currentIdentity.signingIdentitySha256.isEmpty()) {
+            return transitionToUnknownAfterIdentityFailure(
+                context,
+                state,
+                record,
+                externalResult,
+                reasons.distinct().joinToString(",").ifBlank { "IDENTITY_RECHECK_FAILED" }
+            )
+        }
+
+        // The state commit precedes unsuspension. If commit or Device Owner
+        // enforcement fails, the package remains safe/suspended.
+        val approved = mergeCurrentIdentity(
+            existing = record,
+            identity = currentIdentity,
+            audit = currentAudit,
+            now = System.currentTimeMillis(),
+            status = AdmissionStatus.APPROVED,
+            externalResult = externalResult,
+            enforcementMessage = "EXTERNAL_ALLOW_IDENTITY_VERIFIED"
+        )
+        if (!saveState(context, state.copy(records = state.records.toMutableMap().apply {
+            put(packageName, approved)
+        }))) return false
+
+        if (!suspendPackageIfNeeded(context, packageName, false)) {
+            val pending = approved.copy(
+                status = AdmissionStatus.PENDING,
+                finalDecision = ClassificationDecision.UNKNOWN,
+                statusUpdatedAtEpochMs = System.currentTimeMillis(),
+                enforcementMessage = "UNSUSPEND_FAILED_FAIL_CLOSED"
+            )
+            saveState(context, state.copy(records = state.records.toMutableMap().apply {
+                put(packageName, pending)
+            }))
+            AdmissionWorkScheduler.enqueue(context, packageName)
+            return false
+        }
         return true
     }
 
     @Synchronized
-    fun getAllRecords(context: Context): List<AdmissionGateRecord> {
-        return loadRecordsInternal(context).values.toList()
-    }
+    fun getRecord(context: Context, packageName: String): AdmissionGateRecord? =
+        loadState(context).records[packageName]
 
     @Synchronized
-    fun getPendingRecords(context: Context): List<AdmissionGateRecord> {
-        return loadRecordsInternal(context).values.filter { it.status == AdmissionStatus.PENDING }
+    fun getAllRecords(context: Context): List<AdmissionGateRecord> =
+        loadState(context).records.values.sortedBy { it.appLabel.lowercase() }
+
+    /** Records with audit/decision information or requiring local attention. */
+    @Synchronized
+    fun getRecordsForUi(context: Context): List<AdmissionGateRecord> =
+        getAllRecords(context).filter {
+            it.status != AdmissionStatus.APPROVED || it.externalResult != null
+        }
+
+    @Synchronized
+    fun getPendingRecords(context: Context): List<AdmissionGateRecord> =
+        getAllRecords(context).filter { it.status == AdmissionStatus.PENDING }
+
+    /** Refreshes and persists local evidence immediately before network work. */
+    @Synchronized
+    fun preparePendingAudit(context: Context, packageName: String): AppAuditResult? {
+        val state = loadState(context)
+        val record = state.records[packageName] ?: return null
+        if (record.status != AdmissionStatus.PENDING) return null
+        if (isHardBlocked(context, packageName) || record.hardBlocked) {
+            onHardBlockedPackage(context, packageName)
+            return null
+        }
+        val packageInfo = AdmissionPackageQueries.getPackageInfo(context.packageManager, packageName)
+            ?: return null
+        if (shouldExemptPackage(context, packageInfo)) return null
+
+        suspendPackageIfNeeded(context, packageName, true)
+        val audit = AppAuditCollector.collect(context, packageInfo)
+        val refreshed = mergeCurrentIdentity(
+            existing = record,
+            identity = audit.identity,
+            audit = audit,
+            now = System.currentTimeMillis(),
+            status = AdmissionStatus.PENDING,
+            externalResult = null,
+            enforcementMessage = "PENDING_AUDIT_REFRESHED"
+        )
+        val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
+            put(packageName, refreshed)
+        }))
+        return audit.takeIf { saved }
     }
 
-    private fun suspendPackageIfNeeded(context: Context, packageName: String, suspend: Boolean) {
-        val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
-        if (dpm == null || !dpm.isDeviceOwnerApp(context.packageName)) {
-            Log.w(TAG, "Not Device Owner. Cannot change suspension for $packageName.")
-            return
-        }
-
-        val adminComponent = LockInAdminReceiver.getComponentName(context)
-        try {
-            val unsuspendable = dpm.setPackagesSuspended(adminComponent, arrayOf(packageName), suspend)
-            if (unsuspendable != null && unsuspendable.contains(packageName)) {
-                Log.e(TAG, "DevicePolicyManager reported $packageName as UNSUSPENDABLE (suspend=$suspend)!")
-            } else {
-                Log.i(TAG, "Successfully updated suspension for $packageName -> suspend=$suspend")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Exception while changing suspension for $packageName (suspend=$suspend): ${e.message}", e)
-        }
+    private fun transitionToUnknownAfterIdentityFailure(
+        context: Context,
+        state: AdmissionGateState,
+        record: AdmissionGateRecord,
+        originalResult: AdmissionExternalResult,
+        reason: String
+    ): Boolean {
+        suspendPackageIfNeeded(context, record.packageName, true)
+        val unknown = originalResult.copy(
+            decision = ClassificationDecision.UNKNOWN,
+            reasonCodes = (originalResult.reasonCodes + reason).distinct(),
+            summary = "External ALLOW was not applied because package identity changed or could not be verified.",
+            errorCode = "IDENTITY_RECHECK_FAILED",
+            retryable = false
+        )
+        val pending = record.copy(
+            status = AdmissionStatus.PENDING,
+            externalResult = unknown,
+            finalDecision = ClassificationDecision.UNKNOWN,
+            statusUpdatedAtEpochMs = System.currentTimeMillis(),
+            enforcementMessage = reason
+        )
+        val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
+            put(record.packageName, pending)
+        }))
+        return false
     }
 
-    private fun shouldExemptPackage(context: Context, packageInfo: PackageInfo, excludePackageName: String?): Boolean {
-        val pkgName = packageInfo.packageName
+    private fun recordFromAudit(
+        audit: AppAuditResult,
+        status: AdmissionStatus,
+        now: Long,
+        installedAtEpochMs: Long = now,
+        hardBlocked: Boolean,
+        externalResult: AdmissionExternalResult?,
+        enforcementMessage: String
+    ): AdmissionGateRecord = AdmissionGateRecord(
+        packageName = audit.identity.packageName,
+        status = status,
+        signingCertDigest = audit.identity.canonicalSigningIdentity,
+        installerPackageName = audit.identity.installSource.installingPackageName,
+        versionCode = audit.identity.versionCode,
+        versionName = audit.identity.versionName,
+        appLabel = audit.appLabel,
+        installedAtEpochMs = installedAtEpochMs,
+        statusUpdatedAtEpochMs = now,
+        signingIdentitySha256 = audit.identity.signingIdentitySha256,
+        initiatingPackageName = audit.identity.installSource.initiatingPackageName,
+        originatingPackageName = audit.identity.installSource.originatingPackageName,
+        packageSource = audit.identity.installSource.packageSource,
+        installSourceReliable = audit.identity.installSource.sourceReliable,
+        auditResult = audit,
+        externalResult = externalResult,
+        finalDecision = when (status) {
+            AdmissionStatus.APPROVED -> ClassificationDecision.ALLOW
+            AdmissionStatus.DENIED -> ClassificationDecision.DENY
+            AdmissionStatus.PENDING -> ClassificationDecision.UNKNOWN
+        },
+        hardBlocked = hardBlocked,
+        reviewQueuedAtEpochMs = if (status == AdmissionStatus.PENDING) now else null,
+        enforcementMessage = enforcementMessage
+    )
 
-        // 1. Exclude triggering new package if grandfathering baseline is running
-        if (excludePackageName != null && pkgName == excludePackageName) {
-            return true
-        }
-
-        // 2. Exclude Lock-In itself
-        if (pkgName == context.packageName) {
-            return true
-        }
-
-        // 3. Exclude Play Store and Google Play Services
-        if (pkgName == "com.android.vending" || pkgName == "com.google.android.gms" || pkgName == "com.google.android.gsf") {
-            return true
-        }
-
-        // 4. Exclude hard-blocked packages (managed by AppBlocklistManager)
-        if (AppBlocklistManager.isPackageBlocked(context, pkgName)) {
-            return true
-        }
-
-        // 5. Exclude System apps
-        val appInfo = packageInfo.applicationInfo ?: return false
-        val isSystem = (appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0) ||
-                (appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0)
-
-        return isSystem
-    }
-
-    private fun getSigningCertDigest(packageInfo: PackageInfo): String {
-        return try {
-            val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val signingInfo = packageInfo.signingInfo ?: return ""
-                if (signingInfo.hasMultipleSigners()) {
-                    signingInfo.apkContentsSigners
-                } else {
-                    signingInfo.signingCertificateHistory
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                packageInfo.signatures
-            }
-
-            if (!signatures.isNullOrEmpty()) {
-                val bytes = signatures[0].toByteArray()
-                val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-                bytesToHex(digest)
-            } else ""
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to compute signing cert digest for ${packageInfo.packageName}: ${e.message}")
-            ""
-        }
-    }
-
-    private fun getInstallerPackageName(pm: PackageManager, packageName: String): String? {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                pm.getInstallSourceInfo(packageName).installingPackageName
-            } else {
-                @Suppress("DEPRECATION")
-                pm.getInstallerPackageName(packageName)
-            }
-        } catch (e: Exception) {
+    private fun mergeCurrentIdentity(
+        existing: AdmissionGateRecord,
+        identity: PackageIdentity,
+        audit: AppAuditResult?,
+        now: Long,
+        status: AdmissionStatus,
+        externalResult: AdmissionExternalResult?,
+        enforcementMessage: String
+    ): AdmissionGateRecord = existing.copy(
+        status = status,
+        signingCertDigest = identity.canonicalSigningIdentity,
+        installerPackageName = identity.installSource.installingPackageName,
+        versionCode = identity.versionCode,
+        versionName = identity.versionName,
+        appLabel = audit?.appLabel ?: existing.appLabel,
+        statusUpdatedAtEpochMs = now,
+        signingIdentitySha256 = identity.signingIdentitySha256,
+        initiatingPackageName = identity.installSource.initiatingPackageName,
+        originatingPackageName = identity.installSource.originatingPackageName,
+        packageSource = identity.installSource.packageSource,
+        installSourceReliable = identity.installSource.sourceReliable,
+        auditResult = audit,
+        externalResult = externalResult,
+        finalDecision = when (status) {
+            AdmissionStatus.APPROVED -> ClassificationDecision.ALLOW
+            AdmissionStatus.DENIED -> ClassificationDecision.DENY
+            AdmissionStatus.PENDING -> ClassificationDecision.UNKNOWN
+        },
+        reviewQueuedAtEpochMs = if (status == AdmissionStatus.PENDING) {
+            existing.reviewQueuedAtEpochMs ?: now
+        } else {
             null
+        },
+        enforcementMessage = enforcementMessage
+    )
+
+    private fun isHardBlocked(context: Context, packageName: String): Boolean =
+        try {
+            AppBlocklistManager.isPackageBlocked(context, packageName)
+        } catch (e: Exception) {
+            Log.w(GATE_TAG, "Hard-block lookup failed for $packageName: ${e.message}")
+            // A failed hard-block lookup must not create an ALLOW path.
+            true
+        }
+
+    private fun enforceHardBlock(context: Context, packageName: String) {
+        try {
+            AppBlocklistManager.blockPackageIfNeeded(context, packageName)
+        } catch (e: Exception) {
+            Log.e(GATE_TAG, "Hard-block enforcement failed for $packageName", e)
         }
     }
 
-    private fun getVersionCode(packageInfo: PackageInfo): Long {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            packageInfo.longVersionCode
+    private fun shouldExemptPackage(context: Context, packageInfo: PackageInfo): Boolean {
+        val packageName = packageInfo.packageName
+        if (packageName == context.packageName) return true
+        if (packageName == "com.android.vending" ||
+            packageName == "com.google.android.gms" ||
+            packageName == "com.google.android.gsf"
+        ) return true
+        val appInfo = packageInfo.applicationInfo ?: return false
+        return appInfo.flags and ApplicationInfo.FLAG_SYSTEM != 0 ||
+            appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0
+    }
+
+    private fun getInstalledPackages(pm: PackageManager): List<PackageInfo> = try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getInstalledPackages(
+                PackageManager.PackageInfoFlags.of(AdmissionPackageQueries.packageInfoFlags().toLong())
+            )
         } else {
             @Suppress("DEPRECATION")
-            packageInfo.versionCode.toLong()
+            pm.getInstalledPackages(AdmissionPackageQueries.packageInfoFlags())
         }
+    } catch (e: Exception) {
+        Log.e(GATE_TAG, "Unable to enumerate installed packages", e)
+        emptyList()
     }
 
-    private fun bytesToHex(bytes: ByteArray): String {
-        val sb = StringBuilder(bytes.size * 2)
-        for (b in bytes) {
-            sb.append(String.format("%02x", b.toInt() and 0xFF))
+    private fun suspendPackageIfNeeded(context: Context, packageName: String, suspend: Boolean): Boolean {
+        val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+            ?: return false
+        if (!dpm.isDeviceOwnerApp(context.packageName)) {
+            Log.w(GATE_TAG, "Not Device Owner; cannot set suspension for $packageName")
+            return false
         }
-        return sb.toString()
-    }
-
-    private fun loadRecordsInternal(context: Context): MutableMap<String, AdmissionGateRecord> {
-        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val jsonString = prefs.getString(KEY_RECORDS_JSON, null) ?: return mutableMapOf()
-
-        val map = mutableMapOf<String, AdmissionGateRecord>()
-        try {
-            val jsonArray = JSONArray(jsonString)
-            for (i in 0 until jsonArray.length()) {
-                val obj = jsonArray.getJSONObject(i)
-                val record = AdmissionGateRecord(
-                    packageName = obj.getString("packageName"),
-                    status = AdmissionStatus.valueOf(obj.getString("status")),
-                    signingCertDigest = obj.optString("signingCertDigest", ""),
-                    installerPackageName = if (obj.has("installerPackageName") && !obj.isNull("installerPackageName")) obj.getString("installerPackageName") else null,
-                    versionCode = obj.optLong("versionCode", 0L),
-                    versionName = if (obj.has("versionName") && !obj.isNull("versionName")) obj.getString("versionName") else null,
-                    appLabel = obj.optString("appLabel", obj.getString("packageName")),
-                    installedAtEpochMs = obj.optLong("installedAtEpochMs", 0L),
-                    statusUpdatedAtEpochMs = obj.optLong("statusUpdatedAtEpochMs", 0L)
-                )
-                map[record.packageName] = record
+        return try {
+            val unsuspendable = dpm.setPackagesSuspended(
+                LockInAdminReceiver.getComponentName(context),
+                arrayOf(packageName),
+                suspend
+            )
+            val succeeded = !unsuspendable.contains(packageName)
+            if (!succeeded) {
+                Log.e(GATE_TAG, "Package $packageName was not changed to suspend=$suspend")
             }
+            succeeded
         } catch (e: Exception) {
-            Log.e(TAG, "Error parsing admission gate records JSON: ${e.message}", e)
+            Log.e(GATE_TAG, "Suspension change failed for $packageName (suspend=$suspend)", e)
+            false
         }
-        return map
     }
 
-    private fun saveRecordsInternal(context: Context, recordsMap: Map<String, AdmissionGateRecord>) {
-        val jsonArray = JSONArray()
-        recordsMap.values.forEach { record ->
-            val obj = JSONObject().apply {
-                put("packageName", record.packageName)
-                put("status", record.status.name)
-                put("signingCertDigest", record.signingCertDigest)
-                put("installerPackageName", record.installerPackageName ?: JSONObject.NULL)
-                put("versionCode", record.versionCode)
-                put("versionName", record.versionName ?: JSONObject.NULL)
-                put("appLabel", record.appLabel)
-                put("installedAtEpochMs", record.installedAtEpochMs)
-                put("statusUpdatedAtEpochMs", record.statusUpdatedAtEpochMs)
+    private fun loadState(context: Context): AdmissionGateState {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val raw = prefs.getString(KEY_STATE_SNAPSHOT, null)
+        if (!raw.isNullOrBlank()) {
+            try {
+                val parsed = stateFromJson(JSONObject(raw))
+                if (parsed.grandfatheringInitialized && parsed.snapshotId.isBlank()) {
+                    throw IllegalStateException("initialized admission state has no snapshot marker")
+                }
+                return normalizeHardBlockedRecords(context, parsed)
+            } catch (e: Exception) {
+                Log.e(GATE_TAG, "Admission snapshot is malformed; failing closed", e)
             }
-            jsonArray.put(obj)
         }
 
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        // Migrate V1's two-key state once. The new state is committed as one
+        // envelope; hard-blocked legacy approvals are discarded.
+        val migrated = migrateLegacyState(context, prefs)
+        if (migrated != null) return normalizeHardBlockedRecords(context, migrated)
+        return emptyState()
+    }
+
+    private fun normalizeHardBlockedRecords(
+        context: Context,
+        state: AdmissionGateState
+    ): AdmissionGateState {
+        var changed = false
+        val normalized = state.records.toMutableMap()
+        normalized.values.toList().forEach { record ->
+            if (record.hardBlocked || isHardBlocked(context, record.packageName)) {
+                enforceHardBlock(context, record.packageName)
+                if (record.status != AdmissionStatus.DENIED || !record.hardBlocked ||
+                    record.finalDecision != ClassificationDecision.DENY
+                ) {
+                    normalized[record.packageName] = record.copy(
+                        status = AdmissionStatus.DENIED,
+                        hardBlocked = true,
+                        finalDecision = ClassificationDecision.DENY,
+                        enforcementMessage = "HARD_BLOCKED_AUTHORITATIVE",
+                        statusUpdatedAtEpochMs = System.currentTimeMillis()
+                    )
+                    changed = true
+                }
+            }
+        }
+        if (!changed) return state
+        val normalizedState = state.copy(records = normalized)
+        saveState(context, normalizedState)
+        return normalizedState
+    }
+
+    private fun migrateLegacyState(
+        context: Context,
+        prefs: android.content.SharedPreferences
+    ): AdmissionGateState? {
+        if (!prefs.contains(LEGACY_KEY_IS_GRANDFATHERED) && !prefs.contains(LEGACY_KEY_RECORDS_JSON)) {
+            return null
+        }
+        val records = mutableMapOf<String, AdmissionGateRecord>()
+        val rawRecords = prefs.getString(LEGACY_KEY_RECORDS_JSON, null)
+        if (!rawRecords.isNullOrBlank()) {
+            try {
+                val array = JSONArray(rawRecords)
+                for (index in 0 until array.length()) {
+                    val json = array.getJSONObject(index)
+                    val packageName = json.getString("packageName")
+                    if (isHardBlocked(context, packageName)) {
+                        enforceHardBlock(context, packageName)
+                        continue
+                    }
+                    val status = runCatching {
+                        AdmissionStatus.valueOf(json.optString("status", AdmissionStatus.PENDING.name))
+                    }.getOrDefault(AdmissionStatus.PENDING)
+                    val digest = json.optString("signingCertDigest", "")
+                    val record = AdmissionGateRecord(
+                        packageName = packageName,
+                        status = status,
+                        signingCertDigest = digest,
+                        installerPackageName = json.nullableString("installerPackageName"),
+                        versionCode = json.optLong("versionCode", 0L),
+                        versionName = json.nullableString("versionName"),
+                        appLabel = json.optString("appLabel", packageName),
+                        installedAtEpochMs = json.optLong("installedAtEpochMs", 0L),
+                        statusUpdatedAtEpochMs = json.optLong("statusUpdatedAtEpochMs", 0L),
+                        signingIdentitySha256 = digest.split(',').map { it.trim() }.filter { it.isNotBlank() },
+                        installSourceReliable = !json.nullableString("installerPackageName").isNullOrBlank(),
+                        finalDecision = when (status) {
+                            AdmissionStatus.APPROVED -> ClassificationDecision.ALLOW
+                            AdmissionStatus.DENIED -> ClassificationDecision.DENY
+                            AdmissionStatus.PENDING -> ClassificationDecision.UNKNOWN
+                        },
+                        enforcementMessage = "MIGRATED_V1_STATE"
+                    )
+                    records[packageName] = record
+                }
+            } catch (e: Exception) {
+                Log.e(GATE_TAG, "Unable to migrate V1 admission records", e)
+            }
+        }
+        val state = AdmissionGateState(
+            schemaVersion = STATE_SCHEMA_VERSION,
+            snapshotId = UUID.randomUUID().toString(),
+            grandfatheringInitialized = prefs.getBoolean(LEGACY_KEY_IS_GRANDFATHERED, false),
+            grandfatheredAtEpochMs = if (prefs.getBoolean(LEGACY_KEY_IS_GRANDFATHERED, false)) {
+                System.currentTimeMillis()
+            } else {
+                null
+            },
+            records = records
+        )
+        saveState(context, state)
+        return state
+    }
+
+    private fun emptyState() = AdmissionGateState(
+        schemaVersion = STATE_SCHEMA_VERSION,
+        snapshotId = "",
+        grandfatheringInitialized = false,
+        grandfatheredAtEpochMs = null,
+        records = mutableMapOf()
+    )
+
+    private fun stateFromJson(json: JSONObject): AdmissionGateState {
+        val records = mutableMapOf<String, AdmissionGateRecord>()
+        val array = json.optJSONArray("records") ?: JSONArray()
+        for (index in 0 until array.length()) {
+            array.optJSONObject(index)?.let { recordFromJson(it)?.let { record -> records[record.packageName] = record } }
+        }
+        val snapshotId = json.optString("snapshotId", "")
+        return AdmissionGateState(
+            schemaVersion = json.optInt("schemaVersion", STATE_SCHEMA_VERSION),
+            snapshotId = snapshotId,
+            grandfatheringInitialized = json.optBoolean("grandfatheringInitialized", false) && snapshotId.isNotBlank(),
+            grandfatheredAtEpochMs = json.nullableLong("grandfatheredAtEpochMs"),
+            records = records
+        )
+    }
+
+    private fun recordFromJson(json: JSONObject): AdmissionGateRecord? = try {
+        val status = AdmissionStatus.valueOf(json.getString("status"))
+        val identityArray = json.optJSONArray("signingIdentitySha256")
+        val legacyDigest = json.optString("signingCertDigest", "")
+        val signers = identityArray?.toStringList().orEmpty().ifEmpty {
+            legacyDigest.split(',').map { it.trim() }.filter { it.isNotBlank() }
+        }
+        AdmissionGateRecord(
+            packageName = json.getString("packageName"),
+            status = status,
+            signingCertDigest = json.optString("signingCertDigest", signers.joinToString(",")),
+            installerPackageName = json.nullableString("installerPackageName"),
+            versionCode = json.optLong("versionCode", 0L),
+            versionName = json.nullableString("versionName"),
+            appLabel = json.optString("appLabel", json.getString("packageName")),
+            installedAtEpochMs = json.optLong("installedAtEpochMs", 0L),
+            statusUpdatedAtEpochMs = json.optLong("statusUpdatedAtEpochMs", 0L),
+            signingIdentitySha256 = signers,
+            initiatingPackageName = json.nullableString("initiatingPackageName"),
+            originatingPackageName = json.nullableString("originatingPackageName"),
+            packageSource = json.nullableInt("packageSource"),
+            installSourceReliable = json.optBoolean("installSourceReliable", !json.nullableString("installerPackageName").isNullOrBlank()),
+            auditResult = json.optJSONObject("auditResult")?.let(::appAuditResultFromJson),
+            externalResult = json.optJSONObject("externalResult")?.let(::admissionExternalResultFromJson),
+            finalDecision = runCatching {
+                ClassificationDecision.valueOf(json.optString("finalDecision", when (status) {
+                    AdmissionStatus.APPROVED -> ClassificationDecision.ALLOW.name
+                    AdmissionStatus.DENIED -> ClassificationDecision.DENY.name
+                    AdmissionStatus.PENDING -> ClassificationDecision.UNKNOWN.name
+                }))
+            }.getOrDefault(ClassificationDecision.UNKNOWN),
+            hardBlocked = json.optBoolean("hardBlocked", false),
+            reviewQueuedAtEpochMs = json.nullableLong("reviewQueuedAtEpochMs"),
+            enforcementMessage = json.nullableString("enforcementMessage")
+        )
+    } catch (e: Exception) {
+        Log.e(GATE_TAG, "Skipping malformed admission record", e)
+        null
+    }
+
+    private fun recordToJson(record: AdmissionGateRecord): JSONObject = JSONObject().apply {
+        put("packageName", record.packageName)
+        put("status", record.status.name)
+        put("signingCertDigest", record.signingCertDigest)
+        putNullable("installerPackageName", record.installerPackageName)
+        put("versionCode", record.versionCode)
+        putNullable("versionName", record.versionName)
+        put("appLabel", record.appLabel)
+        put("installedAtEpochMs", record.installedAtEpochMs)
+        put("statusUpdatedAtEpochMs", record.statusUpdatedAtEpochMs)
+        put("signingIdentitySha256", record.signingIdentitySha256.toJsonArray())
+        putNullable("initiatingPackageName", record.initiatingPackageName)
+        putNullable("originatingPackageName", record.originatingPackageName)
+        putNullable("packageSource", record.packageSource)
+        put("installSourceReliable", record.installSourceReliable)
+        putNullable("auditResult", record.auditResult?.toJson())
+        putNullable("externalResult", record.externalResult?.toJson())
+        put("finalDecision", record.finalDecision.name)
+        put("hardBlocked", record.hardBlocked)
+        putNullable("reviewQueuedAtEpochMs", record.reviewQueuedAtEpochMs)
+        putNullable("enforcementMessage", record.enforcementMessage)
+    }
+
+    private fun saveState(context: Context, state: AdmissionGateState): Boolean {
+        val json = JSONObject().apply {
+            put("schemaVersion", STATE_SCHEMA_VERSION)
+            put("snapshotId", state.snapshotId)
+            put("grandfatheringInitialized", state.grandfatheringInitialized)
+            putNullable("grandfatheredAtEpochMs", state.grandfatheredAtEpochMs)
+            put("records", JSONArray().apply {
+                state.records.values.sortedBy { it.packageName }.forEach { put(recordToJson(it)) }
+            })
+        }.toString()
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_RECORDS_JSON, jsonArray.toString())
-            .apply()
+            .putString(KEY_STATE_SNAPSHOT, json)
+            .commit()
     }
 }

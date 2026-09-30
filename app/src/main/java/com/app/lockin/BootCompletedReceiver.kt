@@ -28,6 +28,7 @@ class BootCompletedReceiver : BroadcastReceiver() {
             // 2. Reconcile Admission Gate states (re-suspend pending/denied apps)
             try {
                 AdmissionGateManager.reconcileState(context)
+                AdmissionWorkScheduler.enqueue(context)
             } catch (e: Exception) {
                 Log.e(TAG, "Exception during Admission Gate boot reconciliation: ${e.message}", e)
             }

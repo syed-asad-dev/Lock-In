@@ -110,11 +110,12 @@ fun LockInScreen() {
     try {
       AdmissionGateManager.initializeGrandfatheringIfNeeded(context)
       AdmissionGateManager.reconcileState(context)
+      AdmissionWorkScheduler.enqueue(context)
     } catch (e: Exception) {
       Log.e("MainActivity", "Exception during Admission Gate startup reconciliation: ${e.message}", e)
     }
 
-    installedPackages.forEach { packageInfo ->
+           installedPackages.forEach { packageInfo ->
       val pkgName = packageInfo.packageName
       
       // Observe-only quarantine logging
@@ -273,8 +274,14 @@ fun LockInScreen() {
               Log.e("MainActivity", "Manual scan: Found $pkgName")
               AppBlocklistManager.blockPackageIfNeeded(context, pkgName)
             }
-          }
-          refreshStatus() 
+           }
+           try {
+             AdmissionGateManager.reconcileState(context)
+             AdmissionWorkScheduler.enqueue(context)
+           } catch (e: Exception) {
+             Log.e("MainActivity", "Admission Gate refresh failed: ${e.message}", e)
+           }
+           refreshStatus() 
         },
         modifier =
           Modifier
@@ -477,9 +484,10 @@ fun AdmissionGateCard(
 ) {
   val context = LocalContext.current
   var actionTrigger by remember { mutableIntStateOf(0) }
-  val pendingRecords = remember(refreshTrigger, actionTrigger) {
-    AdmissionGateManager.getPendingRecords(context)
+  val admissionRecords = remember(refreshTrigger, actionTrigger) {
+    AdmissionGateManager.getRecordsForUi(context)
   }
+  val pendingCount = admissionRecords.count { it.status == AdmissionStatus.PENDING }
 
   val containerColor =
     if (isDeviceOwner) MaterialTheme.colorScheme.surfaceContainerHigh
@@ -503,7 +511,7 @@ fun AdmissionGateCard(
         )
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-          text = "Admission Gate V1",
+          text = "Admission Gate",
           style = MaterialTheme.typography.titleMedium,
           fontWeight = FontWeight.SemiBold,
           color = if (isDeviceOwner) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.outline,
@@ -516,7 +524,7 @@ fun AdmissionGateCard(
           style = MaterialTheme.typography.bodyMedium,
           color = MaterialTheme.colorScheme.error,
         )
-      } else if (pendingRecords.isEmpty()) {
+      } else if (admissionRecords.isEmpty()) {
         Row(verticalAlignment = Alignment.CenterVertically) {
           Icon(
             imageVector = Icons.Default.CheckCircle,
@@ -526,20 +534,61 @@ fun AdmissionGateCard(
           )
           Spacer(modifier = Modifier.width(6.dp))
           Text(
-            text = "No pending app installation requests.",
+            text = "No app admission reviews require attention.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
           )
         }
       } else {
         Text(
-          text = "${pendingRecords.size} pending app(s) suspended awaiting review:",
+          text = if (pendingCount > 0) {
+            "$pendingCount app(s) suspended pending external review"
+          } else {
+            "Recent app admission decisions"
+          },
           style = MaterialTheme.typography.bodyMedium,
           fontWeight = FontWeight.Bold,
-          color = MaterialTheme.colorScheme.error,
+          color = if (pendingCount > 0) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
         )
 
-        pendingRecords.forEach { record ->
+        admissionRecords.forEach { record ->
+          val audit = record.auditResult
+          val external = record.externalResult
+          val installer = record.installerPackageName ?: "Unknown / direct install"
+          val statusText = when (record.status) {
+            AdmissionStatus.PENDING -> "PENDING (suspended)"
+            AdmissionStatus.DENIED -> "DENIED (suspended)"
+            AdmissionStatus.APPROVED -> "APPROVED"
+          }
+          val auditSummary = if (audit == null) {
+            "Not available"
+          } else {
+            val signals = audit.bypassSignals.take(6).joinToString(", ").ifBlank { "none" }
+            "${audit.requestedPermissions.size} permissions; " +
+              "${audit.exportedComponentCount} exported components; signals: $signals"
+          }
+          val capabilitySummary = if (audit == null) {
+            "Not available"
+          } else {
+            buildList {
+              if (audit.hasBrowserCapability || audit.hasBrowsableActivity) add("browser/BROWSABLE")
+              if (audit.hasVpnService) add("VPN")
+              if (audit.hasAccessibilityService) add("accessibility")
+              if (audit.hasDeviceAdminReceiver) add("device admin")
+              if (audit.requestsInstallPackages) add("installs packages")
+              if (audit.requestsSystemAlertWindow) add("overlay")
+              if (audit.queriesAllPackages) add("package queries")
+            }.joinToString(", ").ifBlank { "none detected" }
+          }
+          val reputation = external?.webReputation?.let {
+            listOfNotNull(it.verdict, it.score?.let { score -> "score=$score" }, it.source)
+              .joinToString(" • ")
+          } ?: "Unavailable"
+          val reasons = (
+            external?.reasonCodes.orEmpty() +
+              listOfNotNull(record.enforcementMessage)
+            ).distinct().joinToString(", ").ifBlank { "None supplied" }
+
           Surface(
             color = MaterialTheme.colorScheme.surfaceContainerHighest,
             shape = RoundedCornerShape(12.dp),
@@ -555,46 +604,87 @@ fun AdmissionGateCard(
                 fontWeight = FontWeight.Bold
               )
               Text(
-                text = "Package: ${record.packageName}",
+                text = "Package: ${record.packageName} • v${record.versionName ?: record.versionCode}",
                 style = MaterialTheme.typography.bodySmall,
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
               )
-              val sourceText = record.installerPackageName ?: "Unknown / Direct Sideload"
               Text(
-                text = "Installer: $sourceText",
+                text = "Installer/source: $installer" +
+                  (record.packageSource?.let { " (source=$it)" } ?: ""),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
               )
               Text(
-                text = "Status: PENDING (Suspended)",
+                text = "Status: $statusText",
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.error
+                color = if (record.status == AdmissionStatus.APPROVED) {
+                  MaterialTheme.colorScheme.primary
+                } else {
+                  MaterialTheme.colorScheme.error
+                }
+              )
+              Text(
+                text = "Signing SHA-256: ${record.signingIdentitySha256.joinToString().ifBlank { "Unavailable" }}",
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              Text(
+                text = "Local audit: $auditSummary",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              Text(
+                text = "Capabilities: $capabilitySummary",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              Text(
+                text = "External result: ${external?.decision?.name ?: "NOT_COMPLETED"}",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              Text(
+                text = "Web reputation: $reputation",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+              )
+              external?.summary?.takeIf { it.isNotBlank() }?.let { summary ->
+                Text(
+                  text = "Summary: $summary",
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+              }
+              Text(
+                text = "Final decision: ${record.finalDecision.name}",
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = FontWeight.Bold,
+                color = when (record.finalDecision) {
+                  ClassificationDecision.ALLOW -> MaterialTheme.colorScheme.primary
+                  ClassificationDecision.DENY -> MaterialTheme.colorScheme.error
+                  ClassificationDecision.UNKNOWN -> MaterialTheme.colorScheme.error
+                }
+              )
+              Text(
+                text = "Reasons: $reasons",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
               )
 
-              Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-              ) {
-                Button(
-                  onClick = {
-                    AdmissionGateManager.approvePackage(context, record.packageName)
-                    actionTrigger++
-                  },
-                  modifier = Modifier.weight(1f).height(40.dp)
-                ) {
-                  Text("Approve")
-                }
+              if (record.status == AdmissionStatus.PENDING) {
                 Button(
                   onClick = {
                     AdmissionGateManager.denyPackage(context, record.packageName)
                     actionTrigger++
                   },
                   colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                  modifier = Modifier.weight(1f).height(40.dp)
+                  modifier = Modifier.fillMaxWidth().padding(top = 6.dp).height(40.dp)
                 ) {
-                  Text("Deny")
+                  Text("Deny locally")
                 }
               }
             }
@@ -1137,4 +1227,3 @@ fun checkIsAdminActive(context: Context): Boolean {
 fun LockInScreenPreview() {
   MyApplicationTheme { LockInScreen() }
 }
-

@@ -18,14 +18,19 @@ class PackageInstallReceiver : BroadcastReceiver() {
         if (!packageName.isNullOrBlank()) {
           val replacing = intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)
           Log.i(TAG, "Package installed event received for: $packageName (replacing=$replacing)")
-          
-          // 1. Check existing hard blocklist first
-          AppBlocklistManager.blockPackageIfNeeded(context, packageName)
 
-          // 2. If app is not a hard-blocked package, send to AdmissionGateManager
-          if (!AppBlocklistManager.isPackageBlocked(context, packageName)) {
-            AdmissionGateManager.onPackageInstalled(context, packageName, replacing)
+          // 1. Hard-block policy is authoritative and runs before any
+          // grandfathering, audit, or external review path.
+          AppBlocklistManager.blockPackageIfNeeded(context, packageName)
+          if (AppBlocklistManager.isPackageBlocked(context, packageName)) {
+            AdmissionGateManager.onHardBlockedPackage(context, packageName)
+            return
           }
+
+          // 2. This performs only local PackageManager/DPM work. It suspends,
+          // persists PENDING plus AppAuditResult, and enqueues JobScheduler;
+          // no network operation is allowed on this receiver thread.
+          AdmissionGateManager.onPackageInstalled(context, packageName, replacing)
         }
       }
       Intent.ACTION_PACKAGE_REMOVED -> {

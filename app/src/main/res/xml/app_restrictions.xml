@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<restrictions xmlns:android="http://schemas.android.com/apk/res/android">
+    <restriction
+        android:key="admission_backend_endpoint"
+        android:title="Admission backend endpoint"
+        android:restrictionType="string" />
+    <restriction
+        android:key="admission_backend_bearer_token"
+        android:title="Admission backend credential"
+        android:restrictionType="string" />
+</restrictions>
