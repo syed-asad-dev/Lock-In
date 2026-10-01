@@ -14,7 +14,7 @@ export function createAdmissionServer(config: ServiceConfig = loadConfig(), prov
     try {
       const parsed = parseEvaluateRequest(JSON.parse(await readBody(request)));
       if (!parsed) { writeJson(response, 400, { error: "malformed_request" }); return; }
-      writeJson(response, 200, await evaluateRequest(parsed, providers));
+      writeJson(response, 200, await evaluateRequest(parsed, providers, config.evaluationDeadlineMs));
     } catch (error) {
       if (error instanceof SyntaxError) {
         writeJson(response, 400, { error: "malformed_json" });

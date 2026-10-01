@@ -47,3 +47,15 @@ test("AI unsupported decision is rejected", async () => {
   assert.equal(result.available, false);
   assert.equal(result.errorCode, "AI_MALFORMED_RESPONSE");
 });
+
+test("AI credentials are never sent to an insecure endpoint", async () => {
+  let called = false;
+  const provider = new OpenAiCompatibleClassifierProvider("secret-must-not-leave-https", "http://ai.example.test/v1", "model", 1000, async () => {
+    called = true;
+    return {};
+  });
+  const result = await provider.classify({ identity, audit: audit(), play: null, web: null });
+  assert.equal(result.available, false);
+  assert.equal(result.errorCode, "AI_PROVIDER_INSECURE_ENDPOINT");
+  assert.equal(called, false);
+});

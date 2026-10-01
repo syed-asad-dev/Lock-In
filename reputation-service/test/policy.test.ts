@@ -4,12 +4,12 @@ import { evaluateAdmission } from "../src/policy.js";
 import { unavailable } from "../src/types.js";
 import { audit, identity, request } from "./fixtures.js";
 
-const play = { available: true, errorCode: null, value: { packageName: identity.packageName, title: "Calculator Pro", developer: "Example Tools", description: "A normal calculator for everyday arithmetic.", category: "Productivity", marketSource: "GOOGLE", marketStatus: "PUBLISHED", marketUrl: "https://play.google.com/store/apps/details?id=com.example.calculator", version: "4.2", website: null, rawFields: {} } };
+const play = { available: true, errorCode: null, value: { packageName: identity.packageName, title: "Calculator Pro", developer: "Example Tools", description: "A normal calculator for everyday arithmetic.", category: "Productivity", marketSource: "GOOGLE", marketStatus: "PUBLISHED", marketUrl: "https://play.google.com/store/apps/details?id=com.example.calculator", version: "4.2", website: null } };
 const web = (results: any[]) => ({ available: true, errorCode: null, value: { provider: "brave-search" as const, queries: ["calculator"], results, checkedAtEpochMs: Date.now() } });
 const ai = (decision: "ALLOW" | "DENY" | "UNKNOWN") => ({ available: true, errorCode: null, value: { decision, reasonCodes: ["TEST"], summary: `AI ${decision}`, evidence: [{ type: "classifier", source: "test", detail: "structured evidence", reference: null }] } });
 const normalResults = [
-  { query: "calculator", title: "Calculator help", url: "https://docs.example.org/calculator", description: "A normal arithmetic calculator with history and themes.", extraSnippets: [], sourceDomain: "docs.example.org" },
-  { query: "calculator", title: "Calculator review", url: "https://review.example.net/app", description: "Independent review of the arithmetic utility and its features.", extraSnippets: [], sourceDomain: "review.example.net" },
+  { query: "package", title: "Calculator Pro on Google Play", url: "https://play.google.com/store/apps/details?id=com.example.calculator", description: "Calculator Pro by Example Tools for com.example.calculator.", extraSnippets: [], sourceDomain: "play.google.com" },
+  { query: "package", title: "Example Tools Calculator Pro", url: "https://catalog.example.net/com.example.calculator", description: "Independent listing for com.example.calculator by Example Tools, a normal arithmetic utility.", extraSnippets: [], sourceDomain: "catalog.example.net" },
 ];
 
 test("hard blocked package is DENY before providers", () => {
@@ -44,5 +44,14 @@ test("local browser capability is deterministic DENY", () => {
 
 test("AI malformed/unsupported output cannot allow", () => {
   const result = evaluateAdmission(request(), { play, web: web(normalResults), ai: unavailable("AI_MALFORMED_RESPONSE") });
+  assert.equal(result.classificationDecision, "UNKNOWN");
+});
+
+test("generic positive pages without exact package identity cannot allow", () => {
+  const generic = [
+    { query: "calculator", title: "Calculator help", url: "https://one.example/help", description: "A friendly calculator utility for everyday arithmetic.", extraSnippets: [], sourceDomain: "one.example" },
+    { query: "calculator", title: "Calculator review", url: "https://two.example/review", description: "A positive review of a calculator app.", extraSnippets: [], sourceDomain: "two.example" },
+  ];
+  const result = evaluateAdmission(request(), { play, web: web(generic), ai: ai("ALLOW") });
   assert.equal(result.classificationDecision, "UNKNOWN");
 });

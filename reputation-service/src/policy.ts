@@ -98,14 +98,18 @@ export function evaluateAdmission(request: EvaluateRequest, dependencies: Evalua
 
   const search = dependencies.web.value;
   const prohibitedSearch = search ? prohibitedSearchEvidence(search.results) : { terms: [], domains: new Set<string>() };
-  if (prohibitedSearch.domains.size >= 2 || (prohibitedSearch.domains.size >= 1 && prohibitedSearch.terms.some((term) => /video downloader|private browser|vpn service|proxy/i.test(term)))) {
+  if (prohibitedSearch.domains.size >= 2) {
     reasons.push("WEB_PROHIBITED_FUNCTIONALITY");
     evidence.push(...search!.results.filter((result) => matchesProhibited(result)).slice(0, 6).map((result) =>
       evidenceItem("web-search", "brave-search", `${result.title}: ${result.description}`, result.url)));
     return response(identity, "DENY", reasons, "Independent web results establish prohibited browser, downloader, VPN, proxy, or bypass functionality.", evidence, reputation(search, "flagged"));
   }
 
-  if (dependencies.ai.available && dependencies.ai.value?.decision === "DENY") {
+  const externalProhibitedEvidence = Boolean(
+    search?.results.some(matchesProhibited) ||
+    play?.description && PROHIBITED_TERMS.some((term) => term.test(play.description ?? ""))
+  );
+  if (dependencies.ai.available && dependencies.ai.value?.decision === "DENY" && externalProhibitedEvidence) {
     const ai = dependencies.ai.value;
     return response(identity, "DENY", unique(["AI_CLASSIFIER_DENY", ...ai.reasonCodes]), ai.summary, [...evidence, ...ai.evidence], reputation(search, "flagged"));
   }
@@ -119,8 +123,14 @@ export function evaluateAdmission(request: EvaluateRequest, dependencies: Evalua
   if (audit.collectionErrors.length > 0) reasons.push("LOCAL_AUDIT_INCOMPLETE");
 
   const ai = dependencies.ai.value;
-  const hasPositiveIdentity = Boolean(play?.packageName === identity.packageName && play.title && play.developer && play.description);
-  const hasCorroboratedNormalWeb = search ? corroboratedNormalEvidence(search.results) : false;
+  const hasPositiveIdentity = Boolean(
+    play?.packageName === identity.packageName &&
+    play.title && play.developer && play.description &&
+    play.marketSource?.toUpperCase() === "GOOGLE" &&
+    play.marketStatus?.toUpperCase() === "PUBLISHED" &&
+    isExactPlayMarketUrl(play.marketUrl, identity.packageName)
+  );
+  const hasCorroboratedNormalWeb = search ? corroboratedNormalEvidence(search.results, identity, play) : false;
   if (
     reasons.length === 0 &&
     hasPositiveIdentity &&
@@ -172,10 +182,56 @@ function matchesProhibited(result: SearchEvidence): boolean {
   return PROHIBITED_TERMS.some((term) => term.test(text));
 }
 
-function corroboratedNormalEvidence(results: SearchEvidence[]): boolean {
+function corroboratedNormalEvidence(
+  results: SearchEvidence[],
+  identity: EvaluateRequest["identity"],
+  play: EvaluationDependencies["play"]["value"],
+): boolean {
   const useful = results.filter((result) => !matchesProhibited(result) && result.description.trim().length >= 20);
-  const domains = new Set(useful.map((result) => result.sourceDomain).filter((domain): domain is string => Boolean(domain)));
-  return useful.length >= 2 && domains.size >= 2;
+  const exactPackage = useful.filter((result) => resultMentionsPackage(result, identity.packageName));
+  const domains = new Set(exactPackage.map((result) => result.sourceDomain).filter((domain): domain is string => Boolean(domain)));
+  const hasCanonicalMarket = exactPackage.some((result) => isCanonicalMarketResult(result, identity.packageName));
+  const hasTiedIdentity = exactPackage.some((result) =>
+    isCanonicalMarketResult(result, identity.packageName) ||
+    (Boolean(play?.title && contains(result, play.title)) && Boolean(play?.developer && contains(result, play.developer)))
+  );
+  // Generic reviews or pages controlled by a developer are not enough. The
+  // positive path needs an exact package mention, a canonical market identity,
+  // and an independent exact-package source on another domain.
+  return useful.length >= 2 && hasCanonicalMarket && hasTiedIdentity && domains.size >= 2;
+}
+
+function resultMentionsPackage(result: SearchEvidence, packageName: string): boolean {
+  return `${result.title} ${result.url} ${result.description} ${result.extraSnippets.join(" ")}`
+    .toLowerCase().includes(packageName.toLowerCase());
+}
+
+function isCanonicalMarketResult(result: SearchEvidence, packageName: string): boolean {
+  try {
+    const url = new URL(result.url);
+    return url.hostname.toLowerCase() === "play.google.com" &&
+      url.pathname === "/store/apps/details" &&
+      url.searchParams.get("id")?.toLowerCase() === packageName.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function isExactPlayMarketUrl(value: string | null, packageName: string): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.hostname.toLowerCase() === "play.google.com" &&
+      url.pathname === "/store/apps/details" &&
+      url.searchParams.get("id")?.toLowerCase() === packageName.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function contains(result: SearchEvidence, value: string): boolean {
+  return `${result.title} ${result.url} ${result.description} ${result.extraSnippets.join(" ")}`
+    .toLowerCase().includes(value.toLowerCase());
 }
 
 function reputation(search: EvaluationDependencies["web"]["value"], verdict: string) {

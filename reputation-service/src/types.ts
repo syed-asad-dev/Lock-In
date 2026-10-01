@@ -69,7 +69,6 @@ export interface PlayMetadata {
   marketUrl: string | null;
   version: string | null;
   website: string | null;
-  rawFields: Record<string, unknown>;
 }
 
 export interface SearchEvidence {

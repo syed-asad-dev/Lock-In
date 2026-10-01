@@ -6,7 +6,7 @@ import type { PlayMetadataProvider } from "./providers/play.js";
 import { Matters42PlayMetadataProvider } from "./providers/play.js";
 import type { WebSearchProvider } from "./providers/brave.js";
 import { BraveWebSearchProvider } from "./providers/brave.js";
-import type { EvaluationDependencies, EvaluateRequest, ReputationResponse } from "./types.js";
+import type { EvaluationDependencies, EvaluateRequest, ProviderOutcome, ReputationResponse } from "./types.js";
 import { unavailable } from "./types.js";
 
 export interface ProviderSet {
@@ -28,17 +28,45 @@ export function providersFromConfig(config: ServiceConfig = loadConfig()): Provi
   };
 }
 
-export async function evaluateRequest(request: EvaluateRequest, providers: ProviderSet): Promise<ReputationResponse> {
-  const play = await providers.play.lookup(request.identity);
-  const web = await providers.web.search(request.identity, request.audit, play.value);
-  const ai = await providers.ai.classify({
+export async function evaluateRequest(request: EvaluateRequest, providers: ProviderSet, evaluationDeadlineMs = 12000): Promise<ReputationResponse> {
+  // Run deterministic local policy first so hard-block/browser/VPN decisions
+  // never wait on or depend on an external provider.
+  const deterministic = evaluateAdmission(request, unavailableDependencies());
+  if (deterministic.classificationDecision === "DENY") return deterministic;
+
+  const deadline = Date.now() + evaluationDeadlineMs;
+  const play = await runWithinDeadline(() => providers.play.lookup(request.identity), deadline, "PLAY_EVALUATION_DEADLINE");
+  const web = await runWithinDeadline(() => providers.web.search(request.identity, request.audit, play.value), deadline, "WEB_EVALUATION_DEADLINE");
+  const ai = await runWithinDeadline(() => providers.ai.classify({
     identity: request.identity,
     audit: request.audit,
     play: play.value,
     web: web.value,
-  });
+  }), deadline, "AI_EVALUATION_DEADLINE");
   const dependencies: EvaluationDependencies = { play, web, ai };
   return evaluateAdmission(request, dependencies);
+}
+
+async function runWithinDeadline<T>(
+  operation: () => Promise<ProviderOutcome<T>>,
+  deadline: number,
+  errorCode: string,
+): Promise<ProviderOutcome<T>> {
+  const remaining = deadline - Date.now();
+  if (remaining <= 0) return unavailable(errorCode);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      operation(),
+      new Promise<ProviderOutcome<T>>((resolve) => {
+        timer = setTimeout(() => resolve(unavailable(errorCode)), remaining);
+      }),
+    ]);
+  } catch {
+    return unavailable(errorCode);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export function unavailableDependencies(): EvaluationDependencies {

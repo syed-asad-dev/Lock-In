@@ -45,7 +45,6 @@ export class Matters42PlayMetadataProvider implements PlayMetadataProvider {
           marketUrl: stringValue(body.market_url),
           version: stringValue(body.version),
           website: stringValue(body.website),
-          rawFields: body,
         },
       };
     } catch (error) {

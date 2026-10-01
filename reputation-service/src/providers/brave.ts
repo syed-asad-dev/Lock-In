@@ -29,11 +29,17 @@ export class BraveWebSearchProvider implements WebSearchProvider {
     audit: AppAuditResult,
     play: PlayMetadata | null,
   ): Promise<ProviderOutcome<WebSearchBundle>> {
-    if (!this.apiKey) return unavailable("WEB_PROVIDER_NOT_CONFIGURED");
+    const apiKey = this.apiKey;
+    if (!apiKey) return unavailable("WEB_PROVIDER_NOT_CONFIGURED");
     const queries = buildQueries(identity, audit, play);
     const results: SearchEvidence[] = [];
     try {
-      for (const query of queries) {
+      let nextQuery = 0;
+      const worker = async (): Promise<void> => {
+        while (true) {
+          const queryIndex = nextQuery++;
+          const query = queries[queryIndex];
+          if (!query || results.length >= this.maxResults) return;
         const url = new URL(SEARCH_ENDPOINT);
         url.searchParams.set("q", query);
         url.searchParams.set("count", "5");
@@ -42,7 +48,7 @@ export class BraveWebSearchProvider implements WebSearchProvider {
         const body = await this.fetcher(url.toString(), {
           headers: {
             Accept: "application/json",
-            "X-Subscription-Token": this.apiKey,
+            "X-Subscription-Token": apiKey,
           },
         }, this.timeoutMs);
         if (!isRecord(body)) throw new ProviderHttpError("MALFORMED_RESPONSE");
@@ -50,12 +56,12 @@ export class BraveWebSearchProvider implements WebSearchProvider {
         if (!isRecord(web) || !Array.isArray(web.results)) throw new ProviderHttpError("MALFORMED_RESPONSE");
         for (const item of web.results) {
           if (!isRecord(item)) continue;
-          const title = stringValue(item.title);
+          const title = stringValue(item.title)?.slice(0, 500) ?? null;
           const resultUrl = stringValue(item.url);
-          const description = stringValue(item.description);
+          const description = stringValue(item.description)?.slice(0, 1000) ?? null;
           if (!title || !resultUrl || !description) continue;
           const extraSnippets = Array.isArray(item.extra_snippets)
-            ? item.extra_snippets.filter((v): v is string => typeof v === "string").slice(0, 3)
+            ? item.extra_snippets.filter((v): v is string => typeof v === "string").slice(0, 3).map((v) => v.slice(0, 1000))
             : [];
           results.push({
             query,
@@ -67,8 +73,9 @@ export class BraveWebSearchProvider implements WebSearchProvider {
           });
           if (results.length >= this.maxResults) break;
         }
-        if (results.length >= this.maxResults) break;
-      }
+        }
+      };
+      await Promise.all([worker(), worker(), worker()]);
       return {
         available: true,
         errorCode: null,
@@ -91,16 +98,13 @@ export function buildQueries(identity: PackageIdentity, audit: AppAuditResult, p
   const developer = play?.developer;
   return dedupeStrings([
     `"${packageName}"`,
-    `${packageName} browser`,
-    `${packageName} downloader`,
-    `${packageName} "video downloader"`,
-    `${packageName} "private browser"`,
-    `${packageName} VPN`,
-    `${packageName} proxy`,
+    `${packageName} browser "private browsing" incognito`,
+    `${packageName} downloader "video downloader"`,
+    `${packageName} VPN proxy bypass unblock`,
     `${title} ${developer ?? ""} browser`,
-    `${title} downloader`,
-    ...(developer ? [`${developer} browser`, `${developer} VPN`] : []),
-  ]).slice(0, 11);
+    `${title} ${developer ?? ""} downloader`,
+    ...(developer ? [`${developer} VPN proxy`, `${developer} bypass unblock`] : []),
+  ]).slice(0, 8);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

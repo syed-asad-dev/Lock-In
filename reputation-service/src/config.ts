@@ -8,6 +8,7 @@ export interface ServiceConfig {
   aiProviderModel: string;
   providerTimeoutMs: number;
   maxProviderResults: number;
+  evaluationDeadlineMs: number;
 }
 
 function positiveInt(value: string | undefined, fallback: number, max: number): number {
@@ -24,7 +25,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServiceConfig 
     aiProviderApiKey: env.AI_PROVIDER_API_KEY?.trim() || null,
     aiProviderBaseUrl: env.AI_PROVIDER_BASE_URL?.trim() || null,
     aiProviderModel: env.AI_PROVIDER_MODEL?.trim() || "",
-    providerTimeoutMs: positiveInt(env.PROVIDER_TIMEOUT_MS, 10000, 30000),
+    providerTimeoutMs: positiveInt(env.PROVIDER_TIMEOUT_MS, 2500, 5000),
     maxProviderResults: positiveInt(env.MAX_PROVIDER_RESULTS, 24, 50),
+    evaluationDeadlineMs: positiveInt(env.EVALUATION_DEADLINE_MS, 12000, 14000),
   };
 }
