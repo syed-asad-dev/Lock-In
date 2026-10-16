@@ -72,13 +72,28 @@ class AdmissionIdentityVerifierTest {
     }
 
     @Test
-    fun unknownInstallerIsNotComparedWhenMarkedUnreliable() {
+    fun newlyAvailableInstallSourceDoesNotMatchAnUnreliableIdentity() {
         val result = AdmissionIdentityVerifier.validate(
             expected = identity(installer = null, reliableSource = false),
             actual = identity(installer = "com.example.sideload", reliableSource = true),
             requireVersionMatch = false
         )
 
-        assertTrue(result.isMatch)
+        assertFalse(result.isMatch)
+        assertTrue(result.reasonCodes.contains("IDENTITY_INSTALL_SOURCE_NEWLY_AVAILABLE"))
+    }
+
+    @Test
+    fun newlyPopulatedReliableSourceFieldFailsClosed() {
+        val expected = identity().copy(
+            installSource = identity().installSource.copy(initiatingPackageName = null)
+        )
+        val actual = expected.copy(
+            installSource = expected.installSource.copy(initiatingPackageName = "com.example.installer")
+        )
+        val result = AdmissionIdentityVerifier.validate(expected, actual, requireVersionMatch = false)
+
+        assertFalse(result.isMatch)
+        assertTrue(result.reasonCodes.contains("IDENTITY_INITIATOR_MISMATCH"))
     }
 }

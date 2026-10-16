@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { OpenAiCompatibleClassifierProvider } from "../src/providers/ai.js";
-import { BraveWebSearchProvider, buildQueries } from "../src/providers/brave.js";
+import { BraveWebSearchProvider, buildQueries, registrableDomainOf } from "../src/providers/brave.js";
 import { Matters42PlayMetadataProvider } from "../src/providers/play.js";
 import { audit, identity } from "./fixtures.js";
 
@@ -46,6 +46,12 @@ test("AI unsupported decision is rejected", async () => {
   const result = await provider.classify({ identity, audit: audit(), play: null, web: null });
   assert.equal(result.available, false);
   assert.equal(result.errorCode, "AI_MALFORMED_RESPONSE");
+});
+
+test("source independence collapses subdomains to one registrable domain", () => {
+  assert.equal(registrableDomainOf("https://www.example.com/review"), "example.com");
+  assert.equal(registrableDomainOf("https://cdn.example.com/review"), "example.com");
+  assert.equal(registrableDomainOf("https://review.example.co.uk/app"), "example.co.uk");
 });
 
 test("AI credentials are never sent to an insecure endpoint", async () => {

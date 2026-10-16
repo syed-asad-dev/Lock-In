@@ -69,7 +69,7 @@ export class BraveWebSearchProvider implements WebSearchProvider {
             url: resultUrl,
             description,
             extraSnippets,
-            sourceDomain: domainOf(resultUrl),
+            sourceDomain: registrableDomainOf(resultUrl),
           });
           if (results.length >= this.maxResults) break;
         }
@@ -115,8 +115,20 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function domainOf(value: string): string | null {
-  try { return new URL(value).hostname.toLowerCase(); } catch { return null; }
+export function registrableDomainOf(value: string): string | null {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase().replace(/\.$/, "");
+    if (!hostname || hostname === "localhost" || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname)) return hostname || null;
+    const labels = hostname.split(".").filter(Boolean);
+    if (labels.length < 2) return hostname;
+    const suffix = labels.slice(-2).join(".");
+    const multiLabelSuffixes = new Set([
+      "co.uk", "org.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+      "co.nz", "com.br", "co.jp", "co.in", "com.cn", "com.sg",
+    ]);
+    const count = multiLabelSuffixes.has(suffix) && labels.length >= 3 ? 3 : 2;
+    return labels.slice(-count).join(".");
+  } catch { return null; }
 }
 
 function dedupeResults(results: SearchEvidence[]): SearchEvidence[] {

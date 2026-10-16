@@ -75,7 +75,8 @@ object AppBlocklistManager {
       val resolveInfo = context.packageManager.queryIntentActivities(intent, 0)
       resolveInfo.any { it.activityInfo.packageName == packageName }
     } catch (e: Exception) {
-      false
+      Log.e(TAG, "Unable to verify browser capability for $packageName; failing closed", e)
+      true
     }
   }
 

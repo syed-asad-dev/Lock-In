@@ -14,6 +14,8 @@ import java.util.UUID
 private const val GATE_TAG = "AdmissionGateManager"
 private const val PREFS_NAME = "admission_gate_prefs"
 private const val KEY_STATE_SNAPSHOT = "admission_gate_state_snapshot"
+private const val KEY_STATE_COMMIT_MARKER = "admission_gate_state_commit_marker"
+private const val STATE_COMMIT_TOKEN = "stateCommitToken"
 
 private const val LEGACY_KEY_IS_GRANDFATHERED = "is_grandfathered_initialized"
 private const val LEGACY_KEY_RECORDS_JSON = "admission_gate_records_json"
@@ -31,12 +33,43 @@ data class AdmissionGateState(
 /**
  * Device-owner admission enforcement.
  *
- * The only persisted state is one JSON envelope. The grandfathering marker,
- * snapshot id, and records are committed together, so a restart cannot see a
- * marker from one snapshot with records from another. All allow transitions
- * are fail-closed and persist APPROVED before attempting to unsuspend.
+ * Admission state is one JSON envelope plus a commit marker for that exact
+ * envelope. The marker prevents a failed SharedPreferences commit—which may
+ * still update the process-local preference cache—from becoming trusted.
+ * All allow transitions are fail-closed and persist APPROVED before attempting
+ * to unsuspend.
  */
+internal fun failClosedAdmissionStateAfterPersistenceFailure(
+    state: AdmissionGateState
+): AdmissionGateState = state.copy(
+    records = state.records.mapValuesTo(mutableMapOf()) { (_, record) ->
+        when {
+            record.hardBlocked -> record.copy(
+                status = AdmissionStatus.DENIED,
+                externalResult = null,
+                finalDecision = ClassificationDecision.DENY,
+                enforcementMessage = "HARD_BLOCKED_AUTHORITATIVE"
+            )
+            record.status == AdmissionStatus.APPROVED -> record.copy(
+                status = AdmissionStatus.PENDING,
+                externalResult = null,
+                finalDecision = ClassificationDecision.UNKNOWN,
+                enforcementMessage = "APPROVAL_PERSISTENCE_FAILED_FAIL_CLOSED"
+            )
+            else -> record
+        }
+    }
+)
+
+internal fun isAdmissionSnapshotCommitTrusted(stateCommitToken: String?, marker: String?): Boolean =
+    !stateCommitToken.isNullOrBlank() && stateCommitToken == marker
+
 object AdmissionGateManager {
+    // A failed commit can leave the attempted value in this process's
+    // SharedPreferences cache. Keep that exact token untrusted until a later
+    // successful snapshot-plus-marker save supersedes it.
+    private var untrustedSnapshotToken: String? = null
+
     @Synchronized
     fun isGrandfatheredInitialized(context: Context): Boolean =
         loadState(context).grandfatheringInitialized
@@ -51,14 +84,36 @@ object AdmissionGateManager {
         val snapshotId = UUID.randomUUID().toString()
         val records = existingState.records.toMutableMap()
         val pendingForReview = mutableListOf<String>()
+        // Records created while the one-time baseline was unavailable (for
+        // example by an install receiver) must never be grandfathered later.
+        // An APPROVED record in an uninitialized snapshot is also treated as
+        // untrusted and re-audited.
+        records.values.toList().forEach { record ->
+            if (record.status == AdmissionStatus.APPROVED) {
+                records[record.packageName] = record.copy(
+                    status = AdmissionStatus.PENDING,
+                    finalDecision = ClassificationDecision.UNKNOWN,
+                    enforcementMessage = "BASELINE_UNINITIALIZED_REAUDIT"
+                )
+            }
+            if (records[record.packageName]?.status == AdmissionStatus.PENDING) {
+                suspendPackageIfNeeded(context, record.packageName, true)
+                pendingForReview += record.packageName
+            }
+        }
         var grandfatheredCount = 0
 
         // One package-manager read is the baseline snapshot. The snapshot id
         // is written in the same JSON envelope as every generated record.
-        val installedPackages = getInstalledPackages(pm)
+        val installedSnapshot = getInstalledPackages(pm)
+        if (!installedSnapshot.succeeded) {
+            Log.e(GATE_TAG, "Cannot initialize grandfathering while package enumeration is unavailable; retrying later")
+            return
+        }
+        val installedPackages = installedSnapshot.packages
         installedPackages.forEach { packageInfo ->
             val packageName = packageInfo.packageName
-            if (packageName == excludePackageName) return@forEach
+            if (packageName == excludePackageName || existingState.records.containsKey(packageName)) return@forEach
 
             if (isHardBlocked(context, packageName)) {
                 enforceHardBlock(context, packageName)
@@ -161,6 +216,8 @@ object AdmissionGateManager {
         val preserveApproved = isReplacing &&
             existing?.status == AdmissionStatus.APPROVED &&
             existingIdentityMatches &&
+            sameInstallInstance(existing.auditResult, audit) &&
+            isCleanApprovalAudit(audit) &&
             identity.signingIdentitySha256.isNotEmpty()
 
         val record: AdmissionGateRecord
@@ -169,7 +226,10 @@ object AdmissionGateManager {
             record = mergeCurrentIdentity(
                 existing = existing!!,
                 identity = identity,
-                audit = existing.auditResult,
+                // Keep the approval for a same-signer/source update, but bind
+                // the record to the freshly collected audit rather than an
+                // obsolete pre-update snapshot.
+                audit = audit,
                 now = now,
                 status = AdmissionStatus.APPROVED,
                 externalResult = existing.externalResult,
@@ -274,6 +334,11 @@ object AdmissionGateManager {
     fun onPackageRemoved(context: Context, packageName: String, isReplacing: Boolean) {
         if (isReplacing) return
         val state = loadState(context)
+        val record = state.records[packageName] ?: return
+        // DENIED is package-name persistent by policy: uninstall/reinstall must
+        // not erase a prior denial before the replacement can be audited again.
+        // APPROVED and PENDING records are tied to the removed install instance.
+        if (record.status == AdmissionStatus.DENIED) return
         if (state.records.remove(packageName) != null) saveState(context, state)
     }
 
@@ -287,7 +352,18 @@ object AdmissionGateManager {
 
         val state = loadState(context)
         val records = state.records.toMutableMap()
-        val installedPackages = getInstalledPackages(context.packageManager)
+        val installedSnapshot = getInstalledPackages(context.packageManager)
+        if (!installedSnapshot.succeeded) {
+            // An empty result is not proof that every package was removed. Do
+            // not delete durable state on a transient PackageManager failure;
+            // re-assert only the already-known fail-closed states and retry.
+            records.values.filter { it.status != AdmissionStatus.APPROVED }.forEach { record ->
+                suspendPackageIfNeeded(context, record.packageName, true)
+            }
+            AdmissionWorkScheduler.enqueue(context)
+            return
+        }
+        val installedPackages = installedSnapshot.packages
         val installedMap = installedPackages.associateBy { it.packageName }
         val pendingForReview = mutableListOf<String>()
         val now = System.currentTimeMillis()
@@ -295,7 +371,12 @@ object AdmissionGateManager {
         records.values.toList().forEach { record ->
             val packageInfo = installedMap[record.packageName]
             if (packageInfo == null) {
-                records.remove(record.packageName)
+                // DENIED is intentionally retained across uninstall/reinstall.
+                // Other states describe an install instance that no longer
+                // exists and can be discarded safely.
+                if (record.status != AdmissionStatus.DENIED) {
+                    records.remove(record.packageName)
+                }
                 return@forEach
             }
 
@@ -353,7 +434,9 @@ object AdmissionGateManager {
                         actual = identity,
                         requireVersionMatch = false
                     )
-                    if (!validation.isMatch || identity.signingIdentitySha256.isEmpty()) {
+                    if (!validation.isMatch || identity.signingIdentitySha256.isEmpty() ||
+                        !sameInstallInstance(record.auditResult, audit) || !isCleanApprovalAudit(audit)
+                    ) {
                         suspendPackageIfNeeded(context, record.packageName, true)
                         val pending = mergeCurrentIdentity(
                             existing = record,
@@ -373,7 +456,7 @@ object AdmissionGateManager {
                         val refreshed = mergeCurrentIdentity(
                             existing = record,
                             identity = identity,
-                            audit = record.auditResult,
+                            audit = audit,
                             now = record.statusUpdatedAtEpochMs,
                             status = AdmissionStatus.APPROVED,
                             externalResult = record.externalResult,
@@ -390,6 +473,13 @@ object AdmissionGateManager {
                                 )
                                 pendingForReview += record.packageName
                             }
+                        } else {
+                            // A failed refresh commit must not leave an
+                            // APPROVED value trusted in this reconciliation.
+                            records[record.packageName] = failClosedAdmissionStateAfterPersistenceFailure(
+                                state.copy(records = mutableMapOf(record.packageName to refreshed))
+                            ).records.getValue(record.packageName)
+                            pendingForReview += record.packageName
                         }
                     }
                 }
@@ -453,7 +543,8 @@ object AdmissionGateManager {
     fun applyExternalResult(
         context: Context,
         packageName: String,
-        externalResult: AdmissionExternalResult
+        externalResult: AdmissionExternalResult,
+        reviewedAudit: AppAuditResult
     ): Boolean {
         val state = loadState(context)
         val record = state.records[packageName] ?: return false
@@ -464,47 +555,16 @@ object AdmissionGateManager {
         // A response that raced with a local/external DENY, removal, or an
         // earlier approval is stale and must never overwrite that state.
         if (record.status != AdmissionStatus.PENDING) return false
+        // Do not mutate a newer review/install with an older result, even if
+        // package/signer/source/version are identical.
+        if (record.auditResult?.auditId != reviewedAudit.auditId) return false
 
-        if (externalResult.decision == ClassificationDecision.DENY) {
-            suspendPackageIfNeeded(context, packageName, true)
-            val denied = record.copy(
-                status = AdmissionStatus.DENIED,
-                externalResult = externalResult,
-                finalDecision = ClassificationDecision.DENY,
-                statusUpdatedAtEpochMs = System.currentTimeMillis(),
-                enforcementMessage = "EXTERNAL_DENY_SUSPENDED"
-            )
-            val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
-                put(packageName, denied)
-            }))
-            return saved
-        }
-
-        if (externalResult.decision != ClassificationDecision.ALLOW) {
-            suspendPackageIfNeeded(context, packageName, true)
-            val pending = record.copy(
-                status = AdmissionStatus.PENDING,
-                externalResult = externalResult,
-                finalDecision = ClassificationDecision.UNKNOWN,
-                statusUpdatedAtEpochMs = System.currentTimeMillis(),
-                enforcementMessage = externalResult.reasonCodes.joinToString(",")
-                    .ifBlank { "EXTERNAL_UNKNOWN_SUSPENDED" }
-            )
-            val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
-                put(packageName, pending)
-            }))
-            return saved
-        }
-
-        // ALLOW requires a fresh PackageManager identity check against the
-        // stored install, the original local audit, and the backend response.
+        // Every decision, not only ALLOW, is bound to the install that was
+        // audited. This prevents a delayed DENY/UNKNOWN/ALLOW from being
+        // applied to a same-version reinstall or a replacement package.
         val packageInfo = AdmissionPackageQueries.getPackageInfo(context.packageManager, packageName)
             ?: return transitionToUnknownAfterIdentityFailure(
-                context,
-                state,
-                record,
-                externalResult,
-                "IDENTITY_PACKAGE_MISSING"
+                context, state, record, externalResult, "IDENTITY_PACKAGE_MISSING"
             )
         val currentAudit = AppAuditCollector.collect(context, packageInfo)
         val currentIdentity = currentAudit.identity
@@ -513,8 +573,10 @@ object AdmissionGateManager {
         val responseIdentity = externalResult.identity
         val reasons = mutableListOf<String>()
         if (responseIdentity == null) reasons += "IDENTITY_EXTERNAL_MISSING"
-        if (auditIdentity == null) reasons += "IDENTITY_LOCAL_AUDIT_MISSING"
         if (isHardBlocked(context, packageName)) reasons += "HARD_BLOCKED_AUTHORITATIVE"
+        if (externalResult.decision == ClassificationDecision.ALLOW && auditIdentity == null) {
+            reasons += "IDENTITY_LOCAL_AUDIT_MISSING"
+        }
         if (responseIdentity != null) {
             reasons += AdmissionIdentityVerifier.validate(
                 expected = expectedIdentity,
@@ -528,12 +590,18 @@ object AdmissionGateManager {
                 actual = currentIdentity,
                 requireVersionMatch = true
             ).reasonCodes
+            if (!sameInstallInstance(record.auditResult, currentAudit)) {
+                reasons += "IDENTITY_INSTALL_INSTANCE_MISMATCH"
+            }
         }
         reasons += AdmissionIdentityVerifier.validate(
             expected = expectedIdentity,
             actual = currentIdentity,
             requireVersionMatch = true
         ).reasonCodes
+        if (externalResult.decision == ClassificationDecision.ALLOW && !isCleanApprovalAudit(currentAudit)) {
+            reasons += "LOCAL_AUDIT_UNSAFE_OR_INCOMPLETE"
+        }
 
         if (reasons.isNotEmpty() || currentIdentity.signingIdentitySha256.isEmpty()) {
             return transitionToUnknownAfterIdentityFailure(
@@ -541,8 +609,44 @@ object AdmissionGateManager {
                 state,
                 record,
                 externalResult,
-                reasons.distinct().joinToString(",").ifBlank { "IDENTITY_RECHECK_FAILED" }
+                reasons.distinct().joinToString(",").ifBlank { "IDENTITY_RECHECK_FAILED" },
+                currentAudit
             )
+        }
+
+        if (externalResult.decision == ClassificationDecision.DENY) {
+            suspendPackageIfNeeded(context, packageName, true)
+            val denied = mergeCurrentIdentity(
+                existing = record,
+                identity = currentIdentity,
+                audit = currentAudit,
+                now = System.currentTimeMillis(),
+                status = AdmissionStatus.DENIED,
+                externalResult = externalResult,
+                enforcementMessage = "EXTERNAL_DENY_SUSPENDED"
+            )
+            return saveState(context, state.copy(records = state.records.toMutableMap().apply {
+                put(packageName, denied)
+            }))
+        }
+
+        if (externalResult.decision != ClassificationDecision.ALLOW) {
+            suspendPackageIfNeeded(context, packageName, true)
+            val pending = mergeCurrentIdentity(
+                existing = record,
+                identity = currentIdentity,
+                audit = currentAudit,
+                now = System.currentTimeMillis(),
+                status = AdmissionStatus.PENDING,
+                externalResult = externalResult,
+                enforcementMessage = externalResult.reasonCodes.joinToString(",")
+                    .ifBlank { "EXTERNAL_UNKNOWN_SUSPENDED" }
+            )
+            val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
+                put(packageName, pending)
+            }))
+            if (saved && externalResult.retryable) AdmissionWorkScheduler.enqueue(context, packageName)
+            return saved
         }
 
         // The state commit precedes unsuspension. If commit or Device Owner
@@ -556,9 +660,16 @@ object AdmissionGateManager {
             externalResult = externalResult,
             enforcementMessage = "EXTERNAL_ALLOW_IDENTITY_VERIFIED"
         )
-        if (!saveState(context, state.copy(records = state.records.toMutableMap().apply {
+        val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
             put(packageName, approved)
-        }))) return false
+        }))
+        if (!saved) {
+            // saveState leaves the attempted snapshot untrusted and the
+            // package suspended; retry the external review rather than ever
+            // treating the failed APPROVED write as durable.
+            AdmissionWorkScheduler.enqueue(context, packageName)
+            return false
+        }
 
         if (!suspendPackageIfNeeded(context, packageName, false)) {
             val pending = approved.copy(
@@ -631,26 +742,44 @@ object AdmissionGateManager {
         state: AdmissionGateState,
         record: AdmissionGateRecord,
         originalResult: AdmissionExternalResult,
-        reason: String
+        reason: String,
+        currentAudit: AppAuditResult? = null
     ): Boolean {
+        if (reason.contains("HARD_BLOCKED_AUTHORITATIVE")) {
+            onHardBlockedPackage(context, record.packageName)
+            return false
+        }
         suspendPackageIfNeeded(context, record.packageName, true)
         val unknown = originalResult.copy(
             decision = ClassificationDecision.UNKNOWN,
             reasonCodes = (originalResult.reasonCodes + reason).distinct(),
-            summary = "External ALLOW was not applied because package identity changed or could not be verified.",
+            summary = "External admission result was not applied because package identity changed or could not be verified.",
             errorCode = "IDENTITY_RECHECK_FAILED",
-            retryable = false
+            retryable = true
         )
-        val pending = record.copy(
-            status = AdmissionStatus.PENDING,
-            externalResult = unknown,
-            finalDecision = ClassificationDecision.UNKNOWN,
-            statusUpdatedAtEpochMs = System.currentTimeMillis(),
-            enforcementMessage = reason
-        )
+        val pending = if (currentAudit != null) {
+            mergeCurrentIdentity(
+                existing = record,
+                identity = currentAudit.identity,
+                audit = currentAudit,
+                now = System.currentTimeMillis(),
+                status = AdmissionStatus.PENDING,
+                externalResult = unknown,
+                enforcementMessage = reason
+            )
+        } else {
+            record.copy(
+                status = AdmissionStatus.PENDING,
+                externalResult = unknown,
+                finalDecision = ClassificationDecision.UNKNOWN,
+                statusUpdatedAtEpochMs = System.currentTimeMillis(),
+                enforcementMessage = reason
+            )
+        }
         val saved = saveState(context, state.copy(records = state.records.toMutableMap().apply {
             put(record.packageName, pending)
         }))
+        if (saved) AdmissionWorkScheduler.enqueue(context, record.packageName)
         return false
     }
 
@@ -688,6 +817,24 @@ object AdmissionGateManager {
         reviewQueuedAtEpochMs = if (status == AdmissionStatus.PENDING) now else null,
         enforcementMessage = enforcementMessage
     )
+
+    private fun isCleanApprovalAudit(audit: AppAuditResult): Boolean =
+        audit.collectionErrors.isEmpty() && !audit.componentsTruncated && !audit.capabilitiesTruncated &&
+            !audit.hasVpnService && !audit.hasBrowserCapability && !audit.hasBrowsableActivity &&
+            !audit.hasAccessibilityService && !audit.hasDeviceAdminReceiver && !audit.requestsInstallPackages &&
+            !audit.requestsSystemAlertWindow && !audit.queriesAllPackages && !audit.requestsUsageAccess &&
+            !audit.requestsWriteSettings && !audit.requestsManageExternalStorage && !audit.requestsDeletePackages &&
+            !audit.hasNotificationListenerService && !audit.hasInputMethodService
+
+    private fun sameInstallInstance(previous: AppAuditResult?, current: AppAuditResult): Boolean {
+        if (previous == null) return false
+        // firstInstallTime is the PackageManager's install-instance marker.
+        // A same-version reinstall can otherwise look identical by package,
+        // signer, source, and version alone.
+        return previous.firstInstallTimeEpochMs > 0L &&
+            current.firstInstallTimeEpochMs > 0L &&
+            previous.firstInstallTimeEpochMs == current.firstInstallTimeEpochMs
+    }
 
     private fun mergeCurrentIdentity(
         existing: AdmissionGateRecord,
@@ -754,8 +901,13 @@ object AdmissionGateManager {
             appInfo.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0
     }
 
-    private fun getInstalledPackages(pm: PackageManager): List<PackageInfo> = try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+    private data class InstalledPackagesSnapshot(
+        val packages: List<PackageInfo>,
+        val succeeded: Boolean
+    )
+
+    private fun getInstalledPackages(pm: PackageManager): InstalledPackagesSnapshot = try {
+        val packages = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             pm.getInstalledPackages(
                 PackageManager.PackageInfoFlags.of(AdmissionPackageQueries.packageInfoFlags().toLong())
             )
@@ -763,9 +915,10 @@ object AdmissionGateManager {
             @Suppress("DEPRECATION")
             pm.getInstalledPackages(AdmissionPackageQueries.packageInfoFlags())
         }
+        InstalledPackagesSnapshot(packages, succeeded = true)
     } catch (e: Exception) {
         Log.e(GATE_TAG, "Unable to enumerate installed packages", e)
-        emptyList()
+        InstalledPackagesSnapshot(emptyList(), succeeded = false)
     }
 
     private fun suspendPackageIfNeeded(context: Context, packageName: String, suspend: Boolean): Boolean {
@@ -797,21 +950,58 @@ object AdmissionGateManager {
         val raw = prefs.getString(KEY_STATE_SNAPSHOT, null)
         if (!raw.isNullOrBlank()) {
             try {
-                val parsed = stateFromJson(JSONObject(raw))
-                if (parsed.grandfatheringInitialized && parsed.snapshotId.isBlank()) {
-                    throw IllegalStateException("initialized admission state has no snapshot marker")
+                val json = JSONObject(raw)
+                val parsed = stateFromJson(json)
+                val token = json.optString(STATE_COMMIT_TOKEN, "")
+                val marker = prefs.getString(KEY_STATE_COMMIT_MARKER, null)
+                if (token.isBlank()) {
+                    // Adopt a pre-marker snapshot only after the new marker is
+                    // durably written. A failed adoption is treated exactly
+                    // like any other untrusted approval snapshot.
+                    if (saveState(context, parsed)) {
+                        return normalizeHardBlockedRecords(context, parsed)
+                    }
+                    return failClosedUntrustedState(context, parsed)
+                }
+                if (token == untrustedSnapshotToken || !isAdmissionSnapshotCommitTrusted(token, marker)) {
+                    Log.e(GATE_TAG, "Admission snapshot commit marker mismatch; failing closed")
+                    return failClosedUntrustedState(context, parsed)
                 }
                 return normalizeHardBlockedRecords(context, parsed)
             } catch (e: Exception) {
-                Log.e(GATE_TAG, "Admission snapshot is malformed; failing closed", e)
+                Log.e(GATE_TAG, "Admission snapshot is malformed; quarantining state", e)
+                // Never fall through to the legacy marker or an uninitialized
+                // state after a canonical snapshot has been corrupted: that
+                // would allow a fresh baseline and re-grandfather packages.
+                val quarantined = quarantinedState()
+                saveState(context, quarantined)
+                return quarantined
             }
         }
 
         // Migrate V1's two-key state once. The new state is committed as one
-        // envelope; hard-blocked legacy approvals are discarded.
+        // envelope plus its marker; hard-blocked legacy approvals are discarded.
         val migrated = migrateLegacyState(context, prefs)
-        if (migrated != null) return normalizeHardBlockedRecords(context, migrated)
+        if (migrated != null) {
+            if (saveState(context, migrated)) return normalizeHardBlockedRecords(context, migrated)
+            return failClosedUntrustedState(context, migrated)
+        }
         return emptyState()
+    }
+
+    private fun failClosedUntrustedState(
+        context: Context,
+        state: AdmissionGateState
+    ): AdmissionGateState {
+        state.records.values.filter { it.status == AdmissionStatus.APPROVED }.forEach {
+            suspendPackageIfNeeded(context, it.packageName, true)
+        }
+        val safe = failClosedAdmissionStateAfterPersistenceFailure(state)
+        // Best effort: if this commit also fails, the returned state is still
+        // safe in memory and the marker mismatch keeps the preference cache
+        // from being trusted as an approval on subsequent reads.
+        saveState(context, safe)
+        return safe
     }
 
     private fun normalizeHardBlockedRecords(
@@ -893,7 +1083,11 @@ object AdmissionGateManager {
         }
         val state = AdmissionGateState(
             schemaVersion = STATE_SCHEMA_VERSION,
-            snapshotId = UUID.randomUUID().toString(),
+            snapshotId = if (prefs.getBoolean(LEGACY_KEY_IS_GRANDFATHERED, false)) {
+                UUID.randomUUID().toString()
+            } else {
+                ""
+            },
             grandfatheringInitialized = prefs.getBoolean(LEGACY_KEY_IS_GRANDFATHERED, false),
             grandfatheredAtEpochMs = if (prefs.getBoolean(LEGACY_KEY_IS_GRANDFATHERED, false)) {
                 System.currentTimeMillis()
@@ -902,7 +1096,6 @@ object AdmissionGateManager {
             },
             records = records
         )
-        saveState(context, state)
         return state
     }
 
@@ -914,17 +1107,32 @@ object AdmissionGateManager {
         records = mutableMapOf()
     )
 
+    private fun quarantinedState() = AdmissionGateState(
+        schemaVersion = STATE_SCHEMA_VERSION,
+        snapshotId = "quarantined-${UUID.randomUUID()}",
+        grandfatheringInitialized = true,
+        grandfatheredAtEpochMs = null,
+        records = mutableMapOf()
+    )
+
     private fun stateFromJson(json: JSONObject): AdmissionGateState {
         val records = mutableMapOf<String, AdmissionGateRecord>()
+        val snapshotId = json.optString("snapshotId", "")
+        val grandfatheringInitialized = json.optBoolean("grandfatheringInitialized", false)
+        if (grandfatheringInitialized && snapshotId.isBlank()) {
+            throw IllegalStateException("initialized admission state has no snapshot marker")
+        }
+        if (!grandfatheringInitialized && snapshotId.isNotBlank()) {
+            throw IllegalStateException("uninitialized admission state has a snapshot marker")
+        }
         val array = json.optJSONArray("records") ?: JSONArray()
         for (index in 0 until array.length()) {
             array.optJSONObject(index)?.let { recordFromJson(it)?.let { record -> records[record.packageName] = record } }
         }
-        val snapshotId = json.optString("snapshotId", "")
         return AdmissionGateState(
             schemaVersion = json.optInt("schemaVersion", STATE_SCHEMA_VERSION),
             snapshotId = snapshotId,
-            grandfatheringInitialized = json.optBoolean("grandfatheringInitialized", false) && snapshotId.isNotBlank(),
+            grandfatheringInitialized = grandfatheringInitialized,
             grandfatheredAtEpochMs = json.nullableLong("grandfatheredAtEpochMs"),
             records = records
         )
@@ -994,18 +1202,40 @@ object AdmissionGateManager {
     }
 
     private fun saveState(context: Context, state: AdmissionGateState): Boolean {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val previousMarker = prefs.getString(KEY_STATE_COMMIT_MARKER, null)
+        val commitToken = UUID.randomUUID().toString()
         val json = JSONObject().apply {
             put("schemaVersion", STATE_SCHEMA_VERSION)
             put("snapshotId", state.snapshotId)
             put("grandfatheringInitialized", state.grandfatheringInitialized)
             putNullable("grandfatheredAtEpochMs", state.grandfatheredAtEpochMs)
+            put(STATE_COMMIT_TOKEN, commitToken)
             put("records", JSONArray().apply {
                 state.records.values.sortedBy { it.packageName }.forEach { put(recordToJson(it)) }
             })
         }.toString()
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putString(KEY_STATE_SNAPSHOT, json)
-            .commit()
+
+        // SharedPreferences may update its in-memory map before commit()
+        // returns false. The snapshot is therefore untrusted until the
+        // separate marker commit succeeds and matches the exact snapshot.
+        if (!prefs.edit().putString(KEY_STATE_SNAPSHOT, json).commit()) {
+            untrustedSnapshotToken = commitToken
+            Log.e(GATE_TAG, "Admission snapshot commit failed; approval remains untrusted")
+            return false
+        }
+        if (!prefs.edit().putString(KEY_STATE_COMMIT_MARKER, commitToken).commit()) {
+            // commit() may also leave the failed marker in memory. Restore the
+            // prior marker; the process-local rejected token also blocks trust.
+            prefs.edit().apply {
+                if (previousMarker == null) remove(KEY_STATE_COMMIT_MARKER)
+                else putString(KEY_STATE_COMMIT_MARKER, previousMarker)
+            }.commit()
+            untrustedSnapshotToken = commitToken
+            Log.e(GATE_TAG, "Admission snapshot commit marker failed; approval remains untrusted")
+            return false
+        }
+        untrustedSnapshotToken = null
+        return true
     }
 }

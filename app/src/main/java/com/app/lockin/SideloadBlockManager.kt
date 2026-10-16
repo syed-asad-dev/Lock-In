@@ -9,10 +9,8 @@ private const val TAG = "SideloadBlockManager"
 
 /**
  * Manages sideloading and VPN configuration blocking policies for the Lock-In application:
- * - Disallows installing apps from unknown sources (per-user and globally)
+ * - Allows or disallows installing apps from unknown sources (sideloading)
  * - Disallows user configuration or changes to VPN connections
- *
- * This restriction is permanent/one-way and has no removal mechanism.
  */
 object SideloadBlockManager {
 
@@ -44,6 +42,48 @@ object SideloadBlockManager {
       false
     } catch (e: Exception) {
       Log.e(TAG, "Exception encountered while applying sideload/VPN restrictions: ${e.message}", e)
+      false
+    }
+  }
+
+  fun allowSideloading(context: Context): Boolean {
+    val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
+    if (dpm == null) {
+      Log.w(TAG, "DevicePolicyManager is not available on this device.")
+      return false
+    }
+
+    val adminComponent = LockInAdminReceiver.getComponentName(context)
+
+    if (!dpm.isDeviceOwnerApp(context.packageName)) {
+      Log.w(TAG, "App is not the Device Owner. Cannot clear sideload restriction.")
+      return false
+    }
+
+    return try {
+      dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES)
+      dpm.clearUserRestriction(adminComponent, UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES_GLOBALLY)
+      Log.i(TAG, "Successfully cleared DISALLOW_INSTALL_UNKNOWN_SOURCES and DISALLOW_INSTALL_UNKNOWN_SOURCES_GLOBALLY.")
+      true
+    } catch (e: SecurityException) {
+      Log.e(TAG, "SecurityException encountered while clearing sideload restriction: ${e.message}", e)
+      false
+    } catch (e: Exception) {
+      Log.e(TAG, "Exception encountered while clearing sideload restriction: ${e.message}", e)
+      false
+    }
+  }
+
+  fun checkIsSideloadBlocked(context: Context): Boolean {
+    val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager ?: return false
+    val adminComponent = LockInAdminReceiver.getComponentName(context)
+    return try {
+      if (dpm.isDeviceOwnerApp(context.packageName)) {
+        val restrictions = dpm.getUserRestrictions(adminComponent)
+        restrictions.getBoolean(UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES, false) ||
+          restrictions.getBoolean(UserManager.DISALLOW_INSTALL_UNKNOWN_SOURCES_GLOBALLY, false)
+      } else false
+    } catch (e: Exception) {
       false
     }
   }

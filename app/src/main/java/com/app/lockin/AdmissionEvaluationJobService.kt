@@ -49,12 +49,18 @@ class AdmissionEvaluationJobService : JobService() {
                         this@AdmissionEvaluationJobService,
                         audit
                     )
-                    AdmissionGateManager.applyExternalResult(
+                    val applied = AdmissionGateManager.applyExternalResult(
                         this@AdmissionEvaluationJobService,
                         record.packageName,
-                        result
+                        result,
+                        audit
                     )
-                    if (result.decision == ClassificationDecision.UNKNOWN && result.retryable) {
+                    if ((result.decision == ClassificationDecision.UNKNOWN && result.retryable) ||
+                        (!applied && AdmissionGateManager.getRecord(
+                            this@AdmissionEvaluationJobService,
+                            record.packageName
+                        )?.status == AdmissionStatus.PENDING)
+                    ) {
                         retry = true
                     }
                 }

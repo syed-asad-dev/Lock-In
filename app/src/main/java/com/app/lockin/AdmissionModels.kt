@@ -113,7 +113,10 @@ data class AppAuditResult(
     val hasBootReceiver: Boolean,
     val bypassSignals: List<String>,
     val collectionErrors: List<String>,
-    val collectedAtEpochMs: Long
+    val collectedAtEpochMs: Long,
+    // Local generation token; never used as a provider identity claim. It
+    // distinguishes even identical-version reinstalls and concurrent reviews.
+    val auditId: String = java.util.UUID.randomUUID().toString()
 )
 
 data class WebReputation(
@@ -222,37 +225,39 @@ object AdmissionIdentityVerifier {
 
         val expectedSource = expected.installSource
         val actualSource = actual.installSource
-        if (expectedSource.sourceReliable) {
-            if (!actualSource.sourceReliable) {
-                reasons += "IDENTITY_INSTALL_SOURCE_UNAVAILABLE"
+        if (expectedSource.sourceReliable != actualSource.sourceReliable) {
+            reasons += if (expectedSource.sourceReliable) {
+                "IDENTITY_INSTALL_SOURCE_UNAVAILABLE"
             } else {
-                compareReliableSourceField(
-                    expectedSource.installingPackageName,
-                    actualSource.installingPackageName,
-                    "IDENTITY_INSTALLER_MISMATCH",
-                    reasons
-                )
-                compareReliableSourceField(
-                    expectedSource.initiatingPackageName,
-                    actualSource.initiatingPackageName,
-                    "IDENTITY_INITIATOR_MISMATCH",
-                    reasons
-                )
-                compareReliableSourceField(
-                    expectedSource.originatingPackageName,
-                    actualSource.originatingPackageName,
-                    "IDENTITY_ORIGINATOR_MISMATCH",
-                    reasons
-                )
-                if (expectedSource.packageSource != null &&
-                    expectedSource.packageSource > 0 &&
-                    expectedSource.packageSource != actualSource.packageSource
-                ) {
-                    reasons += "IDENTITY_PACKAGE_SOURCE_MISMATCH"
-                }
+                "IDENTITY_INSTALL_SOURCE_NEWLY_AVAILABLE"
+            }
+        } else if (expectedSource.sourceReliable) {
+            // Once install-source data is part of the bound identity, every
+            // field is significant, including a field that was previously
+            // null. Comparing only non-null expected fields lets a later,
+            // richer PackageManager result silently change the identity.
+            compareReliableSourceField(
+                expectedSource.installingPackageName,
+                actualSource.installingPackageName,
+                "IDENTITY_INSTALLER_MISMATCH",
+                reasons
+            )
+            compareReliableSourceField(
+                expectedSource.initiatingPackageName,
+                actualSource.initiatingPackageName,
+                "IDENTITY_INITIATOR_MISMATCH",
+                reasons
+            )
+            compareReliableSourceField(
+                expectedSource.originatingPackageName,
+                actualSource.originatingPackageName,
+                "IDENTITY_ORIGINATOR_MISMATCH",
+                reasons
+            )
+            if (expectedSource.packageSource != actualSource.packageSource) {
+                reasons += "IDENTITY_PACKAGE_SOURCE_MISMATCH"
             }
         }
-
         return IdentityValidation(reasons.isEmpty(), reasons.distinct())
     }
 
@@ -262,7 +267,7 @@ object AdmissionIdentityVerifier {
         mismatchCode: String,
         reasons: MutableList<String>
     ) {
-        if (!expected.isNullOrBlank() && expected != actual) {
+        if (expected != actual) {
             reasons += mismatchCode
         }
     }
@@ -364,6 +369,7 @@ internal fun AppAuditResult.toJson(): JSONObject = JSONObject().apply {
     put("bypassSignals", bypassSignals.toJsonArray())
     put("collectionErrors", collectionErrors.toJsonArray())
     put("collectedAtEpochMs", collectedAtEpochMs)
+    put("auditId", auditId)
 }
 
 internal fun appAuditResultFromJson(json: JSONObject): AppAuditResult = AppAuditResult(
@@ -413,7 +419,8 @@ internal fun appAuditResultFromJson(json: JSONObject): AppAuditResult = AppAudit
     hasBootReceiver = json.optBoolean("hasBootReceiver", false),
     bypassSignals = json.optJSONArray("bypassSignals").toStringList(),
     collectionErrors = json.optJSONArray("collectionErrors").toStringList(),
-    collectedAtEpochMs = json.optLong("collectedAtEpochMs", 0L)
+    collectedAtEpochMs = json.optLong("collectedAtEpochMs", 0L),
+    auditId = json.optString("auditId", "legacy-audit")
 )
 
 internal fun AdmissionExternalResult.toJson(): JSONObject = JSONObject().apply {

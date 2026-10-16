@@ -1,3 +1,4 @@
+import { registrableDomainOf } from "./providers/brave.js";
 import type {
   AdmissionDecision,
   AppAuditResult,
@@ -97,6 +98,21 @@ export function evaluateAdmission(request: EvaluateRequest, dependencies: Evalua
   }
 
   const search = dependencies.web.value;
+  const hasAuthoritativePlayIdentity = Boolean(
+    dependencies.play.available &&
+    play?.packageName === identity.packageName &&
+    play.marketSource?.toUpperCase() === "GOOGLE" &&
+    play.marketStatus?.toUpperCase() === "PUBLISHED" &&
+    isExactPlayMarketUrl(play.marketUrl, identity.packageName)
+  );
+  const prohibitedPlayMetadata = Boolean(play && PROHIBITED_TERMS.some((term) =>
+    term.test(`${play.title ?? ""} ${play.description ?? ""}`)));
+  if (hasAuthoritativePlayIdentity && prohibitedPlayMetadata && play) {
+    return response(identity, "DENY", ["PLAY_PROHIBITED_FUNCTIONALITY"], "Exact-package authoritative Play metadata advertises prohibited browser, downloader, VPN, proxy, or bypass functionality.", [
+      evidenceItem("play-identity", "42matters", `${play.title ?? ""}: ${play.description ?? ""}`, play.marketUrl),
+    ], reputation(search, "flagged"));
+  }
+
   const prohibitedSearch = search ? prohibitedSearchEvidence(search.results) : { terms: [], domains: new Set<string>() };
   if (prohibitedSearch.domains.size >= 2) {
     reasons.push("WEB_PROHIBITED_FUNCTIONALITY");
@@ -106,13 +122,11 @@ export function evaluateAdmission(request: EvaluateRequest, dependencies: Evalua
   }
 
   const externalProhibitedEvidence = Boolean(
-    search?.results.some(matchesProhibited) ||
-    play?.description && PROHIBITED_TERMS.some((term) => term.test(play.description ?? ""))
+    search?.results.some(matchesProhibited) || prohibitedPlayMetadata
   );
-  if (dependencies.ai.available && dependencies.ai.value?.decision === "DENY" && externalProhibitedEvidence) {
-    const ai = dependencies.ai.value;
-    return response(identity, "DENY", unique(["AI_CLASSIFIER_DENY", ...ai.reasonCodes]), ai.summary, [...evidence, ...ai.evidence], reputation(search, "flagged"));
-  }
+  // AI interprets the supplied evidence; it is not an independent source.
+  // Uncorroborated prohibited wording must hold UNKNOWN even if AI says ALLOW.
+  if (externalProhibitedEvidence) reasons.push("UNCORROBORATED_PROHIBITED_EVIDENCE");
 
   if (!dependencies.play.available || !play) reasons.push("PLAY_METADATA_UNAVAILABLE");
   if (!dependencies.web.available || !search || search.results.length === 0) reasons.push("WEB_REPUTATION_UNAVAILABLE");
@@ -123,12 +137,9 @@ export function evaluateAdmission(request: EvaluateRequest, dependencies: Evalua
   if (audit.collectionErrors.length > 0) reasons.push("LOCAL_AUDIT_INCOMPLETE");
 
   const ai = dependencies.ai.value;
+  if (ai?.decision === "DENY") reasons.push("AI_CLASSIFIER_DENY", ...ai.reasonCodes);
   const hasPositiveIdentity = Boolean(
-    play?.packageName === identity.packageName &&
-    play.title && play.developer && play.description &&
-    play.marketSource?.toUpperCase() === "GOOGLE" &&
-    play.marketStatus?.toUpperCase() === "PUBLISHED" &&
-    isExactPlayMarketUrl(play.marketUrl, identity.packageName)
+    hasAuthoritativePlayIdentity && play?.title && play.developer && play.description
   );
   const hasCorroboratedNormalWeb = search ? corroboratedNormalEvidence(search.results, identity, play) : false;
   if (
@@ -156,7 +167,13 @@ function identityMatchesAudit(request: EvaluateRequest): boolean {
   const audit = request.audit.identity;
   return audit.packageName === request.identity.packageName &&
     audit.versionCode === request.identity.versionCode &&
-    sameSet(audit.signingIdentitySha256, request.identity.signingIdentitySha256);
+    audit.versionName === request.identity.versionName &&
+    sameSet(audit.signingIdentitySha256, request.identity.signingIdentitySha256) &&
+    audit.installSource.installingPackageName === request.identity.installSource.installingPackageName &&
+    audit.installSource.initiatingPackageName === request.identity.installSource.initiatingPackageName &&
+    audit.installSource.originatingPackageName === request.identity.installSource.originatingPackageName &&
+    audit.installSource.packageSource === request.identity.installSource.packageSource &&
+    audit.installSource.sourceReliable === request.identity.installSource.sourceReliable;
 }
 
 function localHardCapabilityReasons(audit: AppAuditResult): string[] {
@@ -172,7 +189,8 @@ function prohibitedSearchEvidence(results: SearchEvidence[]): { terms: string[];
   for (const result of results) {
     if (!matchesProhibited(result)) continue;
     for (const term of PROHIBITED_TERMS) if (term.test(`${result.title} ${result.description} ${result.extraSnippets.join(" ")}`)) terms.add(term.source);
-    if (result.sourceDomain) domains.add(result.sourceDomain);
+    const domain = registrableDomainOf(result.url);
+    if (domain) domains.add(domain);
   }
   return { terms: [...terms], domains };
 }
@@ -189,7 +207,9 @@ function corroboratedNormalEvidence(
 ): boolean {
   const useful = results.filter((result) => !matchesProhibited(result) && result.description.trim().length >= 20);
   const exactPackage = useful.filter((result) => resultMentionsPackage(result, identity.packageName));
-  const domains = new Set(exactPackage.map((result) => result.sourceDomain).filter((domain): domain is string => Boolean(domain)));
+  const domains = new Set(exactPackage
+    .map((result) => registrableDomainOf(result.url))
+    .filter((domain): domain is string => Boolean(domain)));
   const hasCanonicalMarket = exactPackage.some((result) => isCanonicalMarketResult(result, identity.packageName));
   const hasTiedIdentity = exactPackage.some((result) =>
     isCanonicalMarketResult(result, identity.packageName) ||

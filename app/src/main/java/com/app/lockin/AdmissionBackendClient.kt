@@ -11,6 +11,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.util.Locale
 import java.util.UUID
 
 private const val BACKEND_TAG = "AdmissionBackendClient"
@@ -270,21 +271,14 @@ object AdmissionBackendClient {
                     retryable = false
                 )
 
-            val decisionValue = listOf("classificationDecision", "decision", "classification")
-                .asSequence()
-                .mapNotNull { key -> root.optString(key, "").trim().takeIf { it.isNotEmpty() } }
-                .firstOrNull()
-                ?: return unknownResult(
-                    identity = responseIdentity,
-                    errorCode = "MALFORMED_RESPONSE_DECISION",
-                    reasonCodes = listOf("EXTERNAL_RESPONSE_MALFORMED"),
-                    summary = "External response did not contain a classification decision.",
-                    httpStatus = httpStatus,
-                    evaluatedAtEpochMs = now,
-                    retryable = false
-                )
-            val decision = runCatching { ClassificationDecision.valueOf(decisionValue.uppercase()) }
-                .getOrNull()
+            val decision = if (root.has("classificationDecision") &&
+                !root.isNull("classificationDecision") &&
+                root.get("classificationDecision") is String
+            ) {
+                runCatching { ClassificationDecision.valueOf(root.getString("classificationDecision")) }.getOrNull()
+            } else {
+                null
+            }
                 ?: return unknownResult(
                     identity = responseIdentity,
                     errorCode = "MALFORMED_RESPONSE_DECISION",
@@ -305,7 +299,22 @@ object AdmissionBackendClient {
                     evaluatedAtEpochMs = now,
                     retryable = false
                 )
-            val reasonCodes = reasonArray.toStringList()
+            val reasonCodes = mutableListOf<String>()
+            for (index in 0 until reasonArray.length()) {
+                val value = reasonArray.opt(index)
+                if (value !is String || value.trim().isBlank()) {
+                    return unknownResult(
+                        identity = responseIdentity,
+                        errorCode = "MALFORMED_RESPONSE_REASONS",
+                        reasonCodes = listOf("EXTERNAL_RESPONSE_MALFORMED"),
+                        summary = "External response reason codes were malformed.",
+                        httpStatus = httpStatus,
+                        evaluatedAtEpochMs = now,
+                        retryable = false
+                    )
+                }
+                reasonCodes += value.trim()
+            }
             if (reasonCodes.size != reasonArray.length()) {
                 return unknownResult(
                     identity = responseIdentity,
@@ -357,9 +366,14 @@ object AdmissionBackendClient {
                         evaluatedAtEpochMs = now,
                         retryable = false
                     )
-                val type = evidenceJson.nullableString("type")
-                val detail = evidenceJson.nullableString("detail")
-                if (type.isNullOrBlank() || detail.isNullOrBlank()) {
+                val type = strictNullableString(evidenceJson, "type")
+                val detail = strictNullableString(evidenceJson, "detail")
+                val source = strictNullableString(evidenceJson, "source")
+                val reference = strictNullableString(evidenceJson, "reference")
+                if (type.isNullOrBlank() || detail.isNullOrBlank() ||
+                    (evidenceJson.has("source") && !evidenceJson.isNull("source") && source == null) ||
+                    (evidenceJson.has("reference") && !evidenceJson.isNull("reference") && reference == null)
+                ) {
                     return unknownResult(
                         identity = responseIdentity,
                         errorCode = "MALFORMED_RESPONSE_EVIDENCE",
@@ -372,9 +386,9 @@ object AdmissionBackendClient {
                 }
                 evidence += ExternalEvidence(
                     type = type,
-                    source = evidenceJson.nullableString("source"),
+                    source = source,
                     detail = detail,
-                    reference = evidenceJson.nullableString("reference")
+                    reference = reference
                 )
             }
 
@@ -402,12 +416,65 @@ object AdmissionBackendClient {
                         evaluatedAtEpochMs = now,
                         retryable = false
                     )
+                if (!reputationJson.has("verdict") || !reputationJson.has("score") ||
+                    !reputationJson.has("categories") || !reputationJson.has("source") ||
+                    !reputationJson.has("checkedAtEpochMs") || !validNullableString(reputationJson, "verdict") ||
+                    !validNullableString(reputationJson, "source") ||
+                    !validNullableLong(reputationJson, "checkedAtEpochMs")
+                ) return unknownResult(
+                    identity = responseIdentity,
+                    errorCode = "MALFORMED_RESPONSE_REPUTATION",
+                    reasonCodes = listOf("EXTERNAL_RESPONSE_MALFORMED"),
+                    summary = "External response web reputation was malformed.",
+                    httpStatus = httpStatus,
+                    evaluatedAtEpochMs = now,
+                    retryable = false
+                )
+                val categoriesArray = reputationJson.optJSONArray("categories")
+                    ?: return unknownResult(
+                        identity = responseIdentity,
+                        errorCode = "MALFORMED_RESPONSE_REPUTATION",
+                        reasonCodes = listOf("EXTERNAL_RESPONSE_MALFORMED"),
+                        summary = "External response web reputation was malformed.",
+                        httpStatus = httpStatus,
+                        evaluatedAtEpochMs = now,
+                        retryable = false
+                    )
+                val categories = mutableListOf<String>()
+                for (index in 0 until categoriesArray.length()) {
+                    val category = categoriesArray.opt(index)
+                    if (category !is String || category.isBlank()) {
+                        return unknownResult(
+                            identity = responseIdentity,
+                            errorCode = "MALFORMED_RESPONSE_REPUTATION",
+                            reasonCodes = listOf("EXTERNAL_RESPONSE_MALFORMED"),
+                            summary = "External response web reputation was malformed.",
+                            httpStatus = httpStatus,
+                            evaluatedAtEpochMs = now,
+                            retryable = false
+                        )
+                    }
+                    categories += category
+                }
+                val score = if (reputationJson.has("score") && !reputationJson.isNull("score")) {
+                    val rawScore = reputationJson.opt("score")
+                    if (rawScore !is Number || !rawScore.toDouble().isFinite()) return unknownResult(
+                        identity = responseIdentity,
+                        errorCode = "MALFORMED_RESPONSE_REPUTATION",
+                        reasonCodes = listOf("EXTERNAL_RESPONSE_MALFORMED"),
+                        summary = "External response web reputation was malformed.",
+                        httpStatus = httpStatus,
+                        evaluatedAtEpochMs = now,
+                        retryable = false
+                    )
+                    rawScore.toDouble()
+                } else null
                 WebReputation(
-                    verdict = reputationJson.nullableString("verdict"),
-                    score = reputationJson.nullableDouble("score"),
-                    categories = reputationJson.optJSONArray("categories").toStringList(),
-                    source = reputationJson.nullableString("source"),
-                    checkedAtEpochMs = reputationJson.nullableLong("checkedAtEpochMs")
+                    verdict = strictNullableString(reputationJson, "verdict"),
+                    score = score,
+                    categories = categories,
+                    source = strictNullableString(reputationJson, "source"),
+                    checkedAtEpochMs = strictNullableLong(reputationJson, "checkedAtEpochMs")
                 )
             }
 
@@ -438,27 +505,79 @@ object AdmissionBackendClient {
 
     private fun packageIdentityFromJsonStrict(json: JSONObject): PackageIdentity? {
         return try {
-            val packageName = json.nullableString("packageName")?.takeIf { it.isNotBlank() } ?: return null
-            if (!json.has("versionCode") || json.isNull("versionCode")) return null
-            val signers = when {
-                json.optJSONArray("signingIdentitySha256") != null ->
-                    json.optJSONArray("signingIdentitySha256")!!.toStringList()
-                json.optString("signingIdentitySha256", "").isNotBlank() ->
-                    listOf(json.optString("signingIdentitySha256").trim())
-                else -> emptyList()
+            val packageName = strictRequiredString(json, "packageName")?.takeIf { it.isNotBlank() } ?: return null
+            val rawVersion = json.opt("versionCode")
+            if (rawVersion !is Number || rawVersion.toLong() < 0L || rawVersion.toDouble() != rawVersion.toLong().toDouble()) return null
+            if (!json.has("versionName") || !validNullableString(json, "versionName")) return null
+            val signersArray = json.optJSONArray("signingIdentitySha256") ?: return null
+            val signers = mutableListOf<String>()
+            for (index in 0 until signersArray.length()) {
+                val signer = signersArray.opt(index)
+                if (signer !is String || !Regex("^[a-fA-F0-9]{64}$").matches(signer)) return null
+                signers += signer.lowercase(Locale.ROOT)
             }
-            if (signers.isEmpty()) return null
+            if (signers.isEmpty() || signers.distinct().size != signers.size) return null
+            val installSourceJson = json.optJSONObject("installSource") ?: return null
+            val installSource = installSourceFromJsonStrict(installSourceJson) ?: return null
             PackageIdentity(
                 packageName = packageName,
-                versionCode = json.getLong("versionCode"),
-                versionName = json.nullableString("versionName"),
+                versionCode = rawVersion.toLong(),
+                versionName = strictNullableString(json, "versionName"),
                 signingIdentitySha256 = signers,
-                installSource = json.optJSONObject("installSource")?.let(::installSourceFromJson)
-                    ?: InstallSourceIdentity(null, null, null, null, false)
+                installSource = installSource
             )
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun installSourceFromJsonStrict(json: JSONObject): InstallSourceIdentity? {
+        val fields = listOf("installingPackageName", "initiatingPackageName", "originatingPackageName", "packageSource")
+        if (fields.any { !json.has(it) } || !json.has("sourceReliable") || json.opt("sourceReliable") !is Boolean) return null
+        if (!validNullablePackageName(json, "installingPackageName") ||
+            !validNullablePackageName(json, "initiatingPackageName") ||
+            !validNullablePackageName(json, "originatingPackageName") ||
+            !validNullableInt(json, "packageSource")
+        ) return null
+        val reliable = json.getBoolean("sourceReliable")
+        val packageSource = strictNullableInt(json, "packageSource")
+        val installing = strictNullableString(json, "installingPackageName")
+        val initiating = strictNullableString(json, "initiatingPackageName")
+        val originating = strictNullableString(json, "originatingPackageName")
+        if (reliable && installing == null && initiating == null && originating == null && packageSource == null) return null
+        return InstallSourceIdentity(installing, initiating, originating, packageSource, reliable)
+    }
+
+    private fun strictRequiredString(json: JSONObject, key: String): String? =
+        if (json.has(key) && !json.isNull(key) && json.opt(key) is String) json.getString(key) else null
+
+    private fun strictNullableString(json: JSONObject, key: String): String? =
+        if (!json.has(key) || json.isNull(key)) null else strictRequiredString(json, key)
+
+    private fun validNullableString(json: JSONObject, key: String): Boolean =
+        !json.has(key) || json.isNull(key) || json.opt(key) is String
+
+    private fun strictNullableLong(json: JSONObject, key: String): Long? {
+        if (!json.has(key) || json.isNull(key)) return null
+        val value = json.opt(key)
+        return if (value is Number && value.toDouble() == value.toLong().toDouble()) value.toLong() else null
+    }
+
+    private fun validNullableLong(json: JSONObject, key: String): Boolean =
+        !json.has(key) || json.isNull(key) || strictNullableLong(json, key) != null
+
+    private fun strictNullableInt(json: JSONObject, key: String): Int? {
+        val value = strictNullableLong(json, key) ?: return null
+        return value.takeIf { it in Int.MIN_VALUE..Int.MAX_VALUE }?.toInt()
+    }
+
+    private fun validNullableInt(json: JSONObject, key: String): Boolean =
+        !json.has(key) || json.isNull(key) || strictNullableInt(json, key) != null
+
+    private fun validNullablePackageName(json: JSONObject, key: String): Boolean {
+        if (!json.has(key) || json.isNull(key)) return true
+        val value = strictNullableString(json, key) ?: return false
+        return value.matches(Regex("^[A-Za-z0-9_]+(?:\\.[A-Za-z0-9_]+)+$"))
     }
 
     private fun readLimited(input: InputStream): ByteArray {

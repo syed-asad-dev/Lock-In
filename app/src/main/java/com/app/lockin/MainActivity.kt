@@ -235,17 +235,6 @@ fun LockInScreen() {
         modifier = Modifier.testTag("vpn_slot_lock_card"),
       )
 
-      // Emergency Internet Restore Button (Hidden if VPN is working)
-      if (isDeviceOwner) {
-        Button(
-          onClick = { VpnSetupManager.disableAlwaysOnVpn(context) },
-          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondary),
-          modifier = Modifier.fillMaxWidth().height(48.dp)
-        ) {
-          Text("Emergency: Restore Internet (Disable VPN)")
-        }
-      }
-
       // Self-Protection Card
       SelfProtectCard(
         isDeviceOwner = isDeviceOwner,
@@ -781,7 +770,7 @@ fun SafeBootLockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
 @Composable
 fun SideloadBlockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
   val context = LocalContext.current
-  var lockResult by remember { mutableStateOf<Boolean?>(null) }
+  var lockResult by remember { mutableStateOf<String?>(null) }
 
   val containerColor =
     if (isDeviceOwner) MaterialTheme.colorScheme.surfaceContainerHigh
@@ -807,7 +796,7 @@ fun SideloadBlockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
         )
         Spacer(modifier = Modifier.width(8.dp))
         Text(
-          text = "Sideload & VPN Config Block",
+          text = "Sideload & VPN Config Management",
           style = MaterialTheme.typography.titleMedium,
           fontWeight = FontWeight.SemiBold,
           color =
@@ -825,38 +814,52 @@ fun SideloadBlockCard(isDeviceOwner: Boolean, modifier: Modifier = Modifier) {
         )
       } else {
         Text(
-          text = "Disallows installing apps from unknown sources (sideloading) and prevents configuring VPNs.",
+          text = "Controls whether installing apps from unknown sources (sideloading) is allowed or blocked.",
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
       }
 
-      Text(
-        text = "This cannot be undone once applied.",
-        style = MaterialTheme.typography.bodySmall,
-        fontWeight = FontWeight.Bold,
-        color = MaterialTheme.colorScheme.error,
-        modifier = Modifier.testTag("sideload_block_warning_text"),
-      )
-
-      Button(
-        onClick = {
-          lockResult = SideloadBlockManager.applySideloadBlock(context)
-        },
-        enabled = isDeviceOwner,
-        modifier =
-          Modifier
-            .fillMaxWidth()
-            .height(48.dp)
-            .testTag("apply_sideload_block_button"),
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
       ) {
-        Text(text = "Apply Sideload & VPN Block")
+        Button(
+          onClick = {
+            val ok = SideloadBlockManager.allowSideloading(context)
+            lockResult = if (ok) "Sideloading Allowed" else "Failed to allow sideloading"
+          },
+          enabled = isDeviceOwner,
+          modifier =
+            Modifier
+              .weight(1f)
+              .height(48.dp)
+              .testTag("allow_sideload_button"),
+        ) {
+          Text(text = "Allow Sideloading")
+        }
+
+        Button(
+          onClick = {
+            val ok = SideloadBlockManager.applySideloadBlock(context)
+            lockResult = if (ok) "Sideloading & VPN Blocked" else "Failed to apply block"
+          },
+          enabled = isDeviceOwner,
+          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
+          modifier =
+            Modifier
+              .weight(1f)
+              .height(48.dp)
+              .testTag("apply_sideload_block_button"),
+        ) {
+          Text(text = "Block Sideloading")
+        }
       }
 
       if (lockResult != null) {
-        val isSuccess = lockResult == true
+        val isSuccess = lockResult?.contains("Failed") == false
         Text(
-          text = if (isSuccess) "Sideload & VPN Block Applied" else "Failed — check Device Owner status",
+          text = lockResult ?: "",
           style = MaterialTheme.typography.bodyMedium,
           fontWeight = FontWeight.Bold,
           color =
